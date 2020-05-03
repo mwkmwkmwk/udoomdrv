@@ -302,27 +302,27 @@
 #define UHARDDOOM_FIFO_SRDCMD_PUT			0x0204
 #define UHARDDOOM_FIFO_SRDCMD_CMD_WINDOW		0x0208
 #define UHARDDOOM_FIFO_SRDCMD_DATA_WINDOW		0x020c
-#define UHARDDOOM_FIFO_SRDCMD_SIZE			0x40
+#define UHARDDOOM_FIFO_SRDCMD_SIZE			0x400
 #define UHARDDOOM_FIFO_SPANCMD_GET			0x0210
 #define UHARDDOOM_FIFO_SPANCMD_PUT			0x0214
 #define UHARDDOOM_FIFO_SPANCMD_CMD_WINDOW		0x0218
 #define UHARDDOOM_FIFO_SPANCMD_DATA_WINDOW		0x021c
-#define UHARDDOOM_FIFO_SPANCMD_SIZE			0x40
+#define UHARDDOOM_FIFO_SPANCMD_SIZE			0x400
 #define UHARDDOOM_FIFO_COLCMD_GET			0x0220
 #define UHARDDOOM_FIFO_COLCMD_PUT			0x0224
 #define UHARDDOOM_FIFO_COLCMD_CMD_WINDOW		0x0228
 #define UHARDDOOM_FIFO_COLCMD_DATA_WINDOW		0x022c
-#define UHARDDOOM_FIFO_COLCMD_SIZE			0x40
+#define UHARDDOOM_FIFO_COLCMD_SIZE			0x400
 #define UHARDDOOM_FIFO_FXCMD_GET			0x0230
 #define UHARDDOOM_FIFO_FXCMD_PUT			0x0234
 #define UHARDDOOM_FIFO_FXCMD_CMD_WINDOW			0x0238
 #define UHARDDOOM_FIFO_FXCMD_DATA_WINDOW		0x023c
-#define UHARDDOOM_FIFO_FXCMD_SIZE			0x40
+#define UHARDDOOM_FIFO_FXCMD_SIZE			0x400
 #define UHARDDOOM_FIFO_SWRCMD_GET			0x0240
 #define UHARDDOOM_FIFO_SWRCMD_PUT			0x0244
 #define UHARDDOOM_FIFO_SWRCMD_CMD_WINDOW		0x0248
 #define UHARDDOOM_FIFO_SWRCMD_DATA_WINDOW		0x024c
-#define UHARDDOOM_FIFO_SWRCMD_SIZE			0x40
+#define UHARDDOOM_FIFO_SWRCMD_SIZE			0x400
 #define UHARDDOOM_FIFO_CMD_MASK				0x0000000f
 /* The 4 semaphore registers.  Bumped by one by SWR commands, decreased by FE/SRD/SPAN/COL.  */
 #define UHARDDOOM_FIFO_FESEM				0x0250
@@ -375,6 +375,8 @@
 /* The per-client singular PTE TLBs.  */
 #define UHARDDOOM_TLB_CLIENT_PTE_TAG(i)			(0x0440 + (i) * 8)
 #define UHARDDOOM_TLB_CLIENT_PTE_VALUE(i)		(0x0444 + (i) * 8)
+/* The last translated virt address for each client (useful for page fault handling).  */
+#define UHARDDOOM_TLB_CLIENT_VA(i)			(0x0480 + (i) * 4)
 /* The PTE cache pool.  */
 #define UHARDDOOM_TLB_POOL_PTE_TAG(i)			(0x0600 + (i) * 8)
 #define UHARDDOOM_TLB_POOL_PTE_VALUE(i)			(0x0604 + (i) * 8)
@@ -399,7 +401,8 @@
 #define UHARDDOOM_SRD_STATE_COL				0x00010000
 /* If 1, waiting on SRDSEM.  */
 #define UHARDDOOM_SRD_STATE_SRDSEM			0x10000000
-#define UHARDDOOM_SRD_STATE_MASK			0x1001ffff
+#define UHARDDOOM_SRD_STATE_FESEM			0x20000000
+#define UHARDDOOM_SRD_STATE_MASK			0x3001ffff
 /* The virtual base address of the source.  */
 #define UHARDDOOM_SRD_SRC_PTR				0x0a04
 /* The pitch of the source.  */
@@ -457,12 +460,11 @@
 #define UHARDDOOM_SWR_STATE_DST_BUF_FULL		0x00080000
 #define UHARDDOOM_SWR_STATE_TRANS_POS_MASK		0x07f00000
 #define UHARDDOOM_SWR_STATE_TRANS_POS_SHIFT		20
-/* If 1, pending FESEM, SRDSEM, COLSEM, SPANSEM.  */
-#define UHARDDOOM_SWR_STATE_FESEM			0x10000000
-#define UHARDDOOM_SWR_STATE_SRDSEM			0x20000000
-#define UHARDDOOM_SWR_STATE_COLSEM			0x40000000
-#define UHARDDOOM_SWR_STATE_SPANSEM			0x80000000
-#define UHARDDOOM_SWR_STATE_MASK			0xf7fff7ff
+/* If 1, pending SRDSEM, COLSEM, SPANSEM.  */
+#define UHARDDOOM_SWR_STATE_SRDSEM			0x10000000
+#define UHARDDOOM_SWR_STATE_COLSEM			0x20000000
+#define UHARDDOOM_SWR_STATE_SPANSEM			0x40000000
+#define UHARDDOOM_SWR_STATE_MASK			0x77fff7ff
 #define UHARDDOOM_SWR_TRANSMAP_PTR			0x0b04
 #define UHARDDOOM_SWR_DST_PTR				0x0b08
 #define UHARDDOOM_SWR_DST_PTR_MASK			0xffffffc0
@@ -544,20 +546,21 @@
 #define UHARDDOOM_COL_COLS_SRC_PITCH(i)			(0x2300 + (i) * 4)
 #define UHARDDOOM_COL_COLS_USTART(i)			(0x2400 + (i) * 4)
 #define UHARDDOOM_COL_COLS_USTEP(i)			(0x2500 + (i) * 4)
-#define UHARDDOOM_COL_COLS_STATE(i)			(0x2600 + (i) * 4)
-#define UHARDDOOM_COL_COLS_STATE_DATA_CMAP_MASK		0x0000007f
-#define UHARDDOOM_COL_COLS_STATE_DATA_CMAP_SHIFT	0
-#define UHARDDOOM_COL_COLS_STATE_ULOG_MASK		0x00001f00
-#define UHARDDOOM_COL_COLS_STATE_COL_EN			0x00002000
-#define UHARDDOOM_COL_COLS_STATE_CMAP_B_EN		0x00004000
+#define UHARDDOOM_COL_COLS_SRC_HEIGHT(i)		(0x2600 + (i) * 4)
+#define UHARDDOOM_COL_COLS_SRC_HEIGHT_MASK		0x0000ffff
+#define UHARDDOOM_COL_COLS_STATE(i)			(0x2700 + (i) * 4)
+#define UHARDDOOM_COL_COLS_STATE_COL_EN			0x00000001
+#define UHARDDOOM_COL_COLS_STATE_CMAP_B_EN		0x00000002
+#define UHARDDOOM_COL_COLS_STATE_DATA_CMAP_MASK		0x00003f00
+#define UHARDDOOM_COL_COLS_STATE_DATA_CMAP_SHIFT	8
 #define UHARDDOOM_COL_COLS_STATE_DATA_GET_MASK		0x003f0000
 #define UHARDDOOM_COL_COLS_STATE_DATA_GET_SHIFT		16
 #define UHARDDOOM_COL_COLS_STATE_DATA_PUT_MASK		0x3f000000
 #define UHARDDOOM_COL_COLS_STATE_DATA_PUT_SHIFT		24
 
-#define UHARDDOOM_COL_COLS_STATE_MASK			0x3f3f7f3f
+#define UHARDDOOM_COL_COLS_STATE_MASK			0x3f3f3f03
 /* The CMAP_A data (256 bytes).  */
-#define UHARDDOOM_COL_CMAP_A(i)				(0x2700 + (i))
+#define UHARDDOOM_COL_CMAP_A(i)				(0x2800 + (i))
 /* The pre-textured data.  64 bytes for each lane.  */
 #define UHARDDOOM_COL_DATA(i)				(0x3000 + (i))
 #define UHARDDOOM_COL_DATA_SIZE				64
@@ -583,6 +586,8 @@
 
 /* Section 3: Page tables.  */
 
+#define UHARDDOOM_PAGE_SIZE				0x1000
+#define UHARDDOOM_PAGE_SHIFT				12
 /* Page directory pointer.  */
 #define UHARDDOOM_PDP_MASK				0x0fffffff
 #define UHARDDOOM_PDP_SHIFT				12
@@ -598,7 +603,7 @@
 #define UHARDDOOM_PTE_PA_SHIFT				8
 #define UHARDDOOM_PTE_MASK				0xfffffff3
 /* Splits the VA into PDI + PTI + OFF */
-#define UHARDDOOM_VA_PDI(va)				((va) >> 20 & 0x3ff)
+#define UHARDDOOM_VA_PDI(va)				((va) >> 22 & 0x3ff)
 #define UHARDDOOM_VA_PTI(va)				((va) >> 12 & 0x3ff)
 #define UHARDDOOM_VA_OFF(va)				((va) & 0xfff)
 /* The parts of VA that are used for tagging PDE and PTE caches.  */
@@ -695,7 +700,7 @@
 
 /* Draw columns.  */
 /* Word 0: command type, enables, number of columns.  */
-#define UHARDDOOM_USER_DRAW_COLUMNS_HEADER(cae, cbe, te, nc)	(UHARDDOOM_USER_CMD_TYPE_DRAW_COLUMNS | (cae) << 8 | (cbe) << 9 | (te) << 12, (nc) << 16)
+#define UHARDDOOM_USER_DRAW_COLUMNS_HEADER(cae, cbe, te, nc)	(UHARDDOOM_USER_CMD_TYPE_DRAW_COLUMNS | (cae) << 8 | (cbe) << 9 | (te) << 12 | (nc) << 16)
 #define UHARDDOOM_USER_DRAW_COLUMNS_HEADER_EXTR_CMAP_A_EN(w)	((w) >> 8 & 1)
 #define UHARDDOOM_USER_DRAW_COLUMNS_HEADER_EXTR_CMAP_B_EN(w)	((w) >> 9 & 1)
 #define UHARDDOOM_USER_DRAW_COLUMNS_HEADER_EXTR_TRANS_EN(w)	((w) >> 12 & 1)
@@ -705,10 +710,10 @@
 /* Word 3 (if enabled in header): colormap A address.  */
 /* Word 4 (if enabled in header): transmap address.  */
 /* The following 5 or 6 words are repeated once for every column.  */
-/* Repeat word 0: x, U mask.  */
+/* Repeat word 0: x, texture height.  */
 #define UHARDDOOM_USER_DRAW_COLUMNS_WR0(x, ulog)	((x) | (ulog) << 16)
 #define UHARDDOOM_USER_DRAW_COLUMNS_WR0_EXTR_X(w)	((w) & 0xffff)
-#define UHARDDOOM_USER_DRAW_COLUMNS_WR0_EXTR_ULOG(w)	((w) >> 16 & 0x1f)
+#define UHARDDOOM_USER_DRAW_COLUMNS_WR0_EXTR_SRC_HEIGHT(w)	((w) >> 16 & 0xffff)
 /* Repeat word 1: y0 and y1.  */
 #define UHARDDOOM_USER_DRAW_COLUMNS_WR1(y0, y1)		((y0) | (y1) << 16)
 #define UHARDDOOM_USER_DRAW_COLUMNS_WR1_EXTR_Y0(w)	((w) & 0xffff)
@@ -825,7 +830,10 @@
 #define UHARDDOOM_SRDCMD_TYPE_SRC_PITCH			0x2
 /* Reads blocks.  */
 #define UHARDDOOM_SRDCMD_TYPE_READ			0x3
+/* Wait for a signal on SRDSEM.  */
 #define UHARDDOOM_SRDCMD_TYPE_SRDSEM			0x4
+/* Send a signal on FESEM.  */
+#define UHARDDOOM_SRDCMD_TYPE_FESEM			0x5
 #define UHARDDOOM_SRDCMD_DATA_READ(len, col)		((len) | (col) << 16)
 #define UHARDDOOM_SRDCMD_DATA_EXTR_READ_LENGTH(cmd)	((cmd) & 0xffff)
 /* If set, send blocks to COL, otherwise to FX.  */
@@ -879,16 +887,16 @@
 #define UHARDDOOM_COLCMD_TYPE_DRAW			0x8
 /* Waits for a signal from SWR on the COLSEM interface, then flushes cache.  */
 #define UHARDDOOM_COLCMD_TYPE_COLSEM			0x9
-#define UHARDDOOM_COLCMD_DATA_COL_SETUP(x, ulog, col_en, cmap_b_en)	((x) | (ulog) << 8 | (col_en) << 13 | (cmap_b_en) << 14)
+#define UHARDDOOM_COLCMD_DATA_COL_SETUP(x, col_en, cmap_b_en, height)	((x) | (col_en) << 8 | (cmap_b_en) << 9 | (height) << 16)
 /* The column X coord in the block.  */
 #define UHARDDOOM_COLCMD_DATA_EXTR_COL_SETUP_X(cmd)	((cmd) & 0x3f)
-/* U coord mask.  */
-#define UHARDDOOM_COLCMD_DATA_EXTR_COL_SETUP_ULOG(cmd)	((cmd) >> 8 & 0x1f)
 /* Column enable — if unset, this column will be disabled and skipped in
  * blocks sent to SWR.  */
-#define UHARDDOOM_COLCMD_DATA_EXTR_COL_SETUP_COL_EN(cmd)	((cmd) >> 13 & 1)
+#define UHARDDOOM_COLCMD_DATA_EXTR_COL_SETUP_COL_EN(cmd)	((cmd) >> 8 & 1)
 /* Colormap B enable.  */
-#define UHARDDOOM_COLCMD_DATA_EXTR_COL_SETUP_CMAP_B_EN(cmd)	((cmd) >> 14 & 1)
+#define UHARDDOOM_COLCMD_DATA_EXTR_COL_SETUP_CMAP_B_EN(cmd)	((cmd) >> 9 & 1)
+/* U coord mask.  */
+#define UHARDDOOM_COLCMD_DATA_EXTR_COL_SETUP_SRC_HEIGHT(cmd)	((cmd) >> 16 & 0xffff)
 /* If enabled, U is mapped to y coord within the source (ie. multiplied by
  * source pitch), otherwise x.  */
 #define UHARDDOOM_COLCMD_DATA_DRAW(len, cmap_a_en)	((len) | (cmap_a_en) << 16)
@@ -947,14 +955,12 @@
 #define UHARDDOOM_SWRCMD_TYPE_DST_PITCH			0x3
 /* Draw blocks from COL or FX.  */
 #define UHARDDOOM_SWRCMD_TYPE_DRAW			0x4
-/* Send a signal on FESEM.  */
-#define UHARDDOOM_SWRCMD_TYPE_FESEM			0x5
 /* Send a signal on SRDSEM.  */
-#define UHARDDOOM_SWRCMD_TYPE_SRDSEM			0x6
+#define UHARDDOOM_SWRCMD_TYPE_SRDSEM			0x5
 /* Send a signal on COLSEM.  */
-#define UHARDDOOM_SWRCMD_TYPE_COLSEM			0x7
+#define UHARDDOOM_SWRCMD_TYPE_COLSEM			0x6
 /* Send a signal on SPANSEM.  */
-#define UHARDDOOM_SWRCMD_TYPE_SPANSEM			0x8
+#define UHARDDOOM_SWRCMD_TYPE_SPANSEM			0x7
 #define UHARDDOOM_SWRCMD_DATA_DRAW(len, c_en, t_en)	((len) | (c_en) << 16 | (t_en) << 17)
 #define UHARDDOOM_SWRCMD_DATA_EXTR_DRAW_LENGTH(cmd)	((cmd) & 0xffff)
 /* If set, draw from COL, otherwise from FX.  */

@@ -14,6 +14,7 @@
 
 #define UHARDDOOM_MAX_DEVICES 256
 
+// #define USE_BATCH
 #define BATCH_BUF_SIZE 0x100
 
 MODULE_AUTHOR("Marcelina Kościelnicka");
@@ -26,6 +27,44 @@ struct uharddoom_fence {
 	uint32_t counter;
 	int active;
 };
+#endif
+
+struct uharddoom_page {
+	void *page_cpu;
+	dma_addr_t page_dma;
+};
+
+struct uharddoom_buffer {
+	struct uharddoom_device *dev;
+	uint32_t size;
+	struct uharddoom_page *pages;
+	uint32_t pnum;
+	struct kref kref;
+};
+
+struct uharddoom_vmap {
+	struct list_head lh;
+	struct uharddoom_buffer *buf;
+	uint32_t va;
+};
+
+struct uharddoom_vspace {
+	struct mutex lock;
+	struct uharddoom_device *dev;
+	__le32 *pd_cpu;
+	dma_addr_t pd_dma;
+	__le32 **pts;
+	struct list_head maps;
+};
+
+#ifndef USE_BATCH
+struct uharddoom_job {
+	struct list_head lh;
+	struct uharddoom_context *ctx;
+	uint32_t cmd_ptr;
+	uint32_t cmd_size;
+};
+#endif
 
 struct uharddoom_device {
 	struct pci_dev *pdev;
@@ -34,13 +73,16 @@ struct uharddoom_device {
 	struct device *dev;
 	void __iomem *bar;
 	spinlock_t slock;
-	struct mutex submit_lock;
-	struct mutex last_lock;
-	struct uharddoom_buffer *last_bufs[7];
-#ifdef USE_CMD_FETCH
-	struct uharddoom_buffer *cmd_buf;
-	int cmd_write_idx;
+	/* XXX */
+#ifdef USE_BATCH
+	struct uharddoom_vspace *batch_vs;
+	struct uharddoom_buffer *batch_buf;
+	int batch_put_idx;
+	int batch_get_idx;
+#else
+	struct list_head pending_jobs;
 #endif
+#if 0
 	int cmd_dirty;
 	int cmds_to_ping;
 	uint32_t fence_wait;
@@ -51,34 +93,20 @@ struct uharddoom_device {
 	int wait_for_free;
 	struct list_head fence_list;
 	uint32_t cmd_pending[8];
+#endif
 };
 
 struct uharddoom_context {
 	struct mutex lock;
 	struct uharddoom_device *dev;
-	struct uharddoom_buffer *bufs[7];
-};
-
-struct uharddoom_buffer {
-	struct uharddoom_device *dev;
-	/* width == 0 means it's not a surface.  */
-	uint32_t size;
-	uint16_t width;
-	uint16_t height;
-	__le32 *pt_cpu;
-	dma_addr_t pt_dma;
-	struct uharddoom_page *pages;
-	uint32_t pnum;
-	struct mutex lock;
-	struct uharddoom_fence read_fence;
-	struct uharddoom_fence free_fence;
-	int dirty;
-	struct kref kref;
-};
-
-struct uharddoom_page {
-	void *page_cpu;
-	dma_addr_t page_dma;
+	struct uharddoom_vspace *vs;
+#ifdef USE_BATCH
+	/* XXX */
+#else
+	int pending_jobs;
+	wait_queue_head_t wq;
+#endif
+	int error;
 };
 
 static dev_t uharddoom_devno;
@@ -89,21 +117,311 @@ static struct class uharddoom_class = {
 	.owner = THIS_MODULE,
 };
 
-/* Hardware handling. */
+/* Hardware access. */
 
 static inline void uharddoom_iow(struct uharddoom_device *dev, uint32_t reg, uint32_t val)
 {
 	iowrite32(val, dev->bar + reg);
-	//printk(KERN_ALERT "uharddoom %03x <- %08x\n", reg, val);
+	printk(KERN_ALERT "uharddoom %03x <- %08x\n", reg, val);
 }
 
 static inline uint32_t uharddoom_ior(struct uharddoom_device *dev, uint32_t reg)
 {
 	uint32_t res = ioread32(dev->bar + reg);
-	//printk(KERN_ALERT "uharddoom %03x -> %08x\n", reg, res);
+	printk(KERN_ALERT "uharddoom %03x -> %08x\n", reg, res);
 	return res;
 }
 
+/* Buffers & vspaces.  */
+
+static struct uharddoom_buffer *uharddoom_buffer_create(struct uharddoom_device *dev, uint32_t size) {
+	int pti;
+	struct uharddoom_buffer *buffer = kzalloc(sizeof *buffer, 1);
+	if (!buffer)
+		return 0;
+	size = round_up(size, PAGE_SIZE);
+	size = round_up(size, UHARDDOOM_PAGE_SIZE);
+	kref_init(&buffer->kref);
+	buffer->dev = dev;
+	buffer->size = size;
+	buffer->pnum = (size + UHARDDOOM_PAGE_SIZE - 1) >> UHARDDOOM_PAGE_SHIFT;
+	buffer->pages = kzalloc(sizeof *buffer->pages * buffer->pnum, GFP_KERNEL);
+	if (!buffer->pages)
+		goto out_pages;
+	// XXX alignment?
+	for (pti = 0; pti < buffer->pnum; pti++)
+		if (!(buffer->pages[pti].page_cpu = dma_alloc_coherent(&dev->pdev->dev,
+				UHARDDOOM_PAGE_SIZE,
+				&buffer->pages[pti].page_dma, GFP_KERNEL | __GFP_ZERO)))
+			goto out_page;
+	printk(KERN_ALERT "CREATE BUF %p %u\n", buffer, kref_read(&buffer->kref));
+	return buffer;
+
+out_page:
+	for (; pti >= 0; pti--)
+		dma_free_coherent(&dev->pdev->dev, UHARDDOOM_PAGE_SIZE, buffer->pages[pti].page_cpu, buffer->pages[pti].page_dma);
+	kfree(buffer->pages);
+out_pages:
+	kfree(buffer);
+	return 0;
+}
+
+static void uharddoom_buffer_destroy(struct kref *kref) {
+	struct uharddoom_buffer *buffer = container_of(kref, struct uharddoom_buffer, kref);
+	struct uharddoom_device *dev = buffer->dev;
+	int pti;
+	printk(KERN_ALERT "KILL BUF %p %u\n", buffer, kref_read(&buffer->kref));
+	for (pti = buffer->pnum - 1; pti >= 0; pti--)
+		dma_free_coherent(&dev->pdev->dev, UHARDDOOM_PAGE_SIZE, buffer->pages[pti].page_cpu, buffer->pages[pti].page_dma);
+	kfree(buffer->pages);
+	kfree(buffer);
+}
+
+static inline struct uharddoom_buffer *uharddoom_buffer_get(struct uharddoom_buffer *buf) {
+	printk(KERN_ALERT "GET BUF %p %u\n", buf, kref_read(&buf->kref));
+	kref_get(&buf->kref);
+	printk(KERN_ALERT "... %p %u\n", buf, kref_read(&buf->kref));
+	return buf;
+}
+
+static void uharddoom_buffer_put(struct uharddoom_buffer *buf) {
+	printk(KERN_ALERT "PUT BUF %p %u\n", buf, kref_read(&buf->kref));
+	kref_put(&buf->kref, uharddoom_buffer_destroy);
+}
+
+static struct uharddoom_vspace *uharddoom_vspace_create(struct uharddoom_device *dev) {
+	struct uharddoom_vspace *vs = kzalloc(sizeof *vs, GFP_KERNEL);
+	if (!vs)
+		goto out_vs;
+	vs->dev = dev;
+	INIT_LIST_HEAD(&vs->maps);
+	mutex_init(&vs->lock);
+	if (!(vs->pd_cpu = dma_alloc_coherent(&dev->pdev->dev,
+			UHARDDOOM_PAGE_SIZE,
+			&vs->pd_dma, GFP_KERNEL | __GFP_ZERO)))
+		goto out_pd;
+	if (!(vs->pts = kzalloc(sizeof *vs->pts * 0x400, GFP_KERNEL)))
+		goto out_pts;
+	return vs;
+
+out_pts:
+	dma_free_coherent(&dev->pdev->dev, UHARDDOOM_PAGE_SIZE, vs->pd_cpu, vs->pd_dma);
+out_pd:
+	mutex_destroy(&vs->lock);
+	kfree(vs);
+out_vs:
+	return 0;
+}
+
+static void uharddoom_vspace_destroy(struct uharddoom_vspace *vs) {
+	struct uharddoom_device *dev = vs->dev;
+	struct list_head *lh, *tmp;
+	int i;
+	list_for_each_safe(lh, tmp, &vs->maps) {
+		struct uharddoom_vmap *map = list_entry(lh, struct uharddoom_vmap, lh);
+		uharddoom_buffer_put(map->buf);
+		kfree(map);
+	}
+	for (i = 0; i < 0x400; i++)
+		if (vs->pts[i]) {
+			uint32_t pde = __le32_to_cpu(vs->pd_cpu[i]);
+			dma_addr_t pt_dma = (uint64_t)(pde & UHARDDOOM_PDE_PA_MASK) << UHARDDOOM_PDE_PA_SHIFT;
+			dma_free_coherent(&dev->pdev->dev, UHARDDOOM_PAGE_SIZE, vs->pts[i], pt_dma);
+		}
+	kfree(vs->pts);
+	dma_free_coherent(&dev->pdev->dev, UHARDDOOM_PAGE_SIZE, vs->pd_cpu, vs->pd_dma);
+	mutex_destroy(&vs->lock);
+	kfree(vs);
+}
+
+static int uharddoom_vspace_map(struct uharddoom_vspace *vs, struct uharddoom_buffer *buf, int map_rdonly, uint32_t *res) {
+	struct uharddoom_device *dev = vs->dev;
+	uint32_t addr = 0, ea;
+	struct list_head *lh, *target;
+	struct uharddoom_vmap *map;
+	int i;
+	if (dev != buf->dev)
+		return -EXDEV;
+	mutex_lock(&vs->lock);
+	target = &vs->maps;
+	ea = addr + buf->pnum * UHARDDOOM_PAGE_SIZE + UHARDDOOM_PAGE_SIZE;
+	list_for_each(lh, &vs->maps) {
+		map = list_entry(lh, struct uharddoom_vmap, lh);
+		if (ea < addr) {
+			mutex_unlock(&vs->lock);
+			return -ENOMEM;
+		}
+		if (map->va >= ea)
+			break;
+		target = lh;
+		addr = map->va + map->buf->pnum * UHARDDOOM_PAGE_SIZE + UHARDDOOM_PAGE_SIZE;
+		ea = addr + buf->pnum * UHARDDOOM_PAGE_SIZE + UHARDDOOM_PAGE_SIZE;
+	}
+	if (ea < addr) {
+		mutex_unlock(&vs->lock);
+		return -ENOMEM;
+	}
+	for (i = addr >> 22; i <= ((ea - 1) >> 22); i++) {
+		dma_addr_t pt_dma;
+		uint32_t pde;
+		if (vs->pts[i])
+			continue;
+		if (!(vs->pts[i] = dma_alloc_coherent(&dev->pdev->dev,
+				UHARDDOOM_PAGE_SIZE,
+				&pt_dma, GFP_KERNEL | __GFP_ZERO))) {
+
+			mutex_unlock(&vs->lock);
+			return -ENOMEM;
+		}
+		pde = pt_dma >> UHARDDOOM_PDE_PA_SHIFT | UHARDDOOM_PDE_PRESENT;
+		vs->pd_cpu[i] = __cpu_to_le32(pde);
+	}
+	map = kzalloc(sizeof *map, GFP_KERNEL);
+	if (!map) {
+		mutex_unlock(&vs->lock);
+		return -ENOMEM;
+	}
+	map->buf = uharddoom_buffer_get(buf);
+	map->va = addr;
+	list_add(&map->lh, target);
+	for (i = 0; i < buf->pnum; i++) {
+		int pti = (addr >> UHARDDOOM_PAGE_SHIFT) + i;
+		int pdi = pti >> 10;
+		uint32_t pte = buf->pages[i].page_dma >> UHARDDOOM_PTE_PA_SHIFT | UHARDDOOM_PTE_PRESENT;
+		if (!map_rdonly)
+			pte |= UHARDDOOM_PTE_WRITABLE;
+		pti &= 0x3ff;
+		vs->pts[pdi][pti] = __cpu_to_le32(pte);
+	}
+	mutex_unlock(&vs->lock);
+	*res = addr;
+	return 0;
+}
+
+static int uharddoom_vspace_unmap(struct uharddoom_vspace *vs, uint32_t addr) {
+	struct list_head *lh;
+	int i;
+	mutex_lock(&vs->lock);
+	list_for_each(lh, &vs->maps) {
+		struct uharddoom_vmap *map = list_entry(lh, struct uharddoom_vmap, lh);
+		if (map->va == addr) {
+			for (i = 0; i < map->buf->pnum; i++) {
+				int pti = (addr >> UHARDDOOM_PAGE_SHIFT) + i;
+				int pdi = pti >> 10;
+				pti &= 0x3ff;
+				vs->pts[pdi][pti] = 0;
+			}
+			uharddoom_iow(vs->dev, UHARDDOOM_RESET, UHARDDOOM_RESET_TLB_USER);
+			uharddoom_ior(vs->dev, UHARDDOOM_STATUS);
+			uharddoom_buffer_put(map->buf);
+			list_del(&map->lh);
+			kfree(map);
+			mutex_unlock(&vs->lock);
+			return 0;
+		}
+	}
+	mutex_unlock(&vs->lock);
+	return -ENOENT;
+}
+
+/* Context handling.  */
+
+static struct uharddoom_context *uharddoom_context_create(struct uharddoom_device *dev) {
+	struct uharddoom_context *ctx = kzalloc(sizeof *ctx, GFP_KERNEL);
+	if (!ctx)
+		return 0;
+	ctx->dev = dev;
+	mutex_init(&ctx->lock);
+	ctx->vs = uharddoom_vspace_create(dev);
+	if (!ctx->vs) {
+		kfree(ctx);
+		return 0;
+	}
+#ifdef USE_BATCH
+	/* XXX */
+#else
+	ctx->pending_jobs = 0;
+	init_waitqueue_head(&ctx->wq);
+#endif
+	return ctx;
+}
+
+static void uharddoom_context_destroy(struct uharddoom_context *ctx) {
+#ifdef USE_BATCH
+	/* XXX */
+#else
+	wait_event(ctx->wq, !ctx->pending_jobs);
+#endif
+	uharddoom_vspace_destroy(ctx->vs);
+	kfree(ctx);
+}
+
+static int uharddoom_context_run(struct uharddoom_context *ctx, uint32_t addr, uint32_t size) {
+	int res = 0;
+	unsigned long flags;
+	struct uharddoom_device *dev = ctx->dev;
+#ifdef USE_BATCH
+	/* XXX */
+#else
+	struct uharddoom_job *job;
+#endif
+	if (addr & 3 || size & 3)
+		return -EINVAL;
+	if (mutex_lock_interruptible(&ctx->lock))
+		return -ERESTARTSYS;
+#ifdef USE_BATCH
+	/* XXX */
+#else
+	if (ctx->error) {
+		res = -EIO;
+		goto out;
+	}
+	job = kzalloc(sizeof *job, GFP_KERNEL);
+	if (!job) {
+		res = -ENOMEM;
+		goto out;
+	}
+	job->ctx = ctx;
+	job->cmd_ptr = addr;
+	job->cmd_size = size;
+	spin_lock_irqsave(&dev->slock, flags);
+	if (list_empty(&dev->pending_jobs)) {
+		uharddoom_iow(dev, UHARDDOOM_JOB_PDP, ctx->vs->pd_dma >> UHARDDOOM_PDP_SHIFT);
+		uharddoom_iow(dev, UHARDDOOM_JOB_CMD_PTR, addr);
+		uharddoom_iow(dev, UHARDDOOM_JOB_CMD_SIZE, size);
+		uharddoom_iow(dev, UHARDDOOM_JOB_TRIGGER, 0);
+	}
+	list_add_tail(&job->lh, &dev->pending_jobs);
+	spin_unlock_irqrestore(&dev->slock, flags);
+	ctx->pending_jobs++;
+#endif
+out:
+	mutex_unlock(&ctx->lock);
+	return res;
+}
+
+static int uharddoom_context_wait(struct uharddoom_context *ctx, int num_back) {
+	int res = 0;
+	if (mutex_lock_interruptible(&ctx->lock))
+		return -ERESTARTSYS;
+#ifdef USE_BATCH
+	/* XXX */
+#else
+	if (wait_event_interruptible(ctx->wq, ctx->pending_jobs <= num_back)) {
+		res = -ERESTARTSYS;
+		goto out;
+	}
+	if (ctx->error) {
+		res = -EIO;
+		goto out;
+	}
+#endif
+out:
+	mutex_unlock(&ctx->lock);
+	return res;
+}
+
+#if 0
 static void uharddoom_process_fences(struct uharddoom_device *dev)
 {
 	struct list_head *lh, *tmp;
@@ -130,7 +448,7 @@ static void uharddoom_process_fences(struct uharddoom_device *dev)
 static void uharddoom_submit_raw(struct uharddoom_device *dev, uint32_t *cmd)
 {
 	int i;
-#ifdef USE_CMD_FETCH
+#ifdef USE_BATCH
 	int pidx = dev->cmd_write_idx / CMDS_PER_PAGE;
 	int cidx = dev->cmd_write_idx % CMDS_PER_PAGE;
 	struct uharddoom_page *page = &dev->cmd_buf->pages[pidx];
@@ -156,7 +474,7 @@ static void uharddoom_fence_cmd(struct uharddoom_device *dev)
 	dev->last_sent_fence++;
 	dev->cmd_pending[0] |= UHARDDOOM_CMD_FLAG_FENCE;
 	uharddoom_submit_raw(dev, dev->cmd_pending);
-#ifdef USE_CMD_FETCH
+#ifdef USE_BATCH
 	uharddoom_iow(dev, UHARDDOOM_CMD_WRITE_IDX, dev->cmd_write_idx);
 #endif
 	dev->cmd_dirty = 0;
@@ -224,7 +542,7 @@ static void uharddoom_fence_set(struct uharddoom_device *dev, struct uharddoom_f
 
 static void uharddoom_update_free_count(struct uharddoom_device *dev)
 {
-#ifdef USE_CMD_FETCH
+#ifdef USE_BATCH
 	int read_idx = uharddoom_ior(dev, UHARDDOOM_CMD_READ_IDX);
 	if (read_idx <= dev->cmd_write_idx)
 		dev->free_count = COMMAND_BUF_SIZE + read_idx - dev->cmd_write_idx - 1;
@@ -273,224 +591,90 @@ static int uharddoom_submit(struct uharddoom_device *dev, uint32_t *cmd)
 	if (!dev->cmds_to_ping) {
 		dev->cmds_to_ping = UHARDDOOM_PING_INTERVAL;
 		dev->cmd_pending[0] |= UHARDDOOM_CMD_FLAG_PING_ASYNC;
-#ifdef USE_CMD_FETCH
+#ifdef USE_BATCH
 		uharddoom_iow(dev, UHARDDOOM_CMD_WRITE_IDX, dev->cmd_write_idx);
 #endif
 	}
 	return 0;
 }
 
+#endif
+
 static irqreturn_t uharddoom_isr(int irq, void *opaque)
 {
 	struct uharddoom_device *dev = opaque;
 	unsigned long flags;
 	uint32_t istatus;
+	int i;
 	spin_lock_irqsave(&dev->slock, flags);
 	istatus = uharddoom_ior(dev, UHARDDOOM_INTR) & uharddoom_ior(dev, UHARDDOOM_INTR_ENABLE);
 	if (istatus) {
+		struct uharddoom_job *job;
 		uharddoom_iow(dev, UHARDDOOM_INTR, istatus);
-		if (istatus & UHARDDOOM_INTR_FENCE) {
-			/* NOTIFY handling -- wake up someone waiting for the device.  */
-			uharddoom_process_fences(dev);
+#ifdef USE_BATCH
+		/* XXX */
+#else
+		BUG_ON(list_empty(&dev->pending_jobs));
+		job = list_first_entry(&dev->pending_jobs, struct uharddoom_job, lh);
+		if (istatus != UHARDDOOM_INTR_JOB_DONE) {
+			if (istatus & (UHARDDOOM_INTR_FE_ERROR))
+				printk(KERN_ALERT "uharddoom: FE_ERROR %03x %08x %08x\n",
+						uharddoom_ior(dev, UHARDDOOM_FE_ERROR_CODE),
+						uharddoom_ior(dev, UHARDDOOM_FE_ERROR_DATA_A),
+						uharddoom_ior(dev, UHARDDOOM_FE_ERROR_DATA_B)
+				);
+			if (istatus & (UHARDDOOM_INTR_CMD_ERROR))
+				printk(KERN_ALERT "uharddoom: CMD_ERROR\n");
+			for (i = 0; i < 8; i++)
+				if (istatus & UHARDDOOM_INTR_PAGE_FAULT(i))
+					printk(KERN_ALERT "uharddoom: PAGE_FAULT %d %08x\n", i,
+							uharddoom_ior(dev, UHARDDOOM_TLB_CLIENT_VA(i)));
+			job->ctx->error = 1;
+			uharddoom_iow(dev, UHARDDOOM_RESET, UHARDDOOM_RESET_ALL);
+			uharddoom_iow(dev, UHARDDOOM_INTR, UHARDDOOM_INTR_MASK);
+			uharddoom_iow(dev, UHARDDOOM_ENABLE, UHARDDOOM_ENABLE_ALL & ~UHARDDOOM_ENABLE_BATCH);
 		}
-		if (istatus & UHARDDOOM_INTR_PONG_ASYNC) {
-			dev->wait_for_free = 0;
-			wake_up(&dev->free_wq);
-			uharddoom_iow(dev, UHARDDOOM_INTR_ENABLE, UHARDDOOM_INTR_MASK & ~UHARDDOOM_INTR_PONG_ASYNC);
+		list_del(&job->lh);
+		job->ctx->pending_jobs--;
+		wake_up(&job->ctx->wq);
+		kfree(job);
+retry:
+		if (!list_empty(&dev->pending_jobs)) {
+			job = list_first_entry(&dev->pending_jobs, struct uharddoom_job, lh);
+			if (job->ctx->error) {
+				list_del(&job->lh);
+				job->ctx->pending_jobs--;
+				wake_up(&job->ctx->wq);
+				kfree(job);
+				goto retry;
+			}
+			uharddoom_iow(dev, UHARDDOOM_JOB_PDP, job->ctx->vs->pd_dma >> UHARDDOOM_PDP_SHIFT);
+			uharddoom_iow(dev, UHARDDOOM_JOB_CMD_PTR, job->cmd_ptr);
+			uharddoom_iow(dev, UHARDDOOM_JOB_CMD_SIZE, job->cmd_size);
+			uharddoom_iow(dev, UHARDDOOM_JOB_TRIGGER, 0);
 		}
-		/* All other interrupts are nonrecoverable errors that should never happen.
-		 * Just log them and leave the device in hung state.  */
-		if (istatus & UHARDDOOM_INTR_FE_ERROR)
-			printk(KERN_ALERT "uharddoom: got FE_ERROR error %03x\n",
-					uharddoom_ior(dev, UHARDDOOM_FE_ERROR_CODE));
-		if (istatus & UHARDDOOM_INTR_CMD_OVERFLOW)
-			printk(KERN_ALERT "uharddoom: got CMD_OVERFLOW error\n");
-		if (istatus & UHARDDOOM_INTR_SURF_SRC_OVERFLOW)
-			printk(KERN_ALERT "uharddoom: got SURF_SRC_OVERFLOW error\n");
-		if (istatus & UHARDDOOM_INTR_SURF_DST_OVERFLOW)
-			printk(KERN_ALERT "uharddoom: got SURF_DST_OVERFLOW error\n");
-		if (istatus & UHARDDOOM_INTR_PAGE_FAULT_CMD)
-			printk(KERN_ALERT "uharddoom: got PAGE_FAULT_CMD error [%08x]\n",
-					uharddoom_ior(dev, UHARDDOOM_TLB_ENTRY_CMD));
-		if (istatus & UHARDDOOM_INTR_PAGE_FAULT_SURF_DST)
-			printk(KERN_ALERT "uharddoom: got PAGE_FAULT_SURF_DST error [%08x]\n",
-					uharddoom_ior(dev, UHARDDOOM_TLB_ENTRY_SURF_DST));
-		if (istatus & UHARDDOOM_INTR_PAGE_FAULT_SURF_SRC)
-			printk(KERN_ALERT "uharddoom: got PAGE_FAULT_SURF_SRC error [%08x]\n",
-					uharddoom_ior(dev, UHARDDOOM_TLB_ENTRY_SURF_SRC));
-		if (istatus & UHARDDOOM_INTR_PAGE_FAULT_TEXTURE)
-			printk(KERN_ALERT "uharddoom: got PAGE_FAULT_TEXTURE error [%08x]\n",
-					uharddoom_ior(dev, UHARDDOOM_TLB_ENTRY_TEXTURE));
-		if (istatus & UHARDDOOM_INTR_PAGE_FAULT_FLAT)
-			printk(KERN_ALERT "uharddoom: got PAGE_FAULT_FLAT error [%08x]\n",
-					uharddoom_ior(dev, UHARDDOOM_TLB_ENTRY_FLAT));
-		if (istatus & UHARDDOOM_INTR_PAGE_FAULT_TRANSLATION)
-			printk(KERN_ALERT "uharddoom: got PAGE_FAULT_TRANSLATION error [%08x]\n",
-					uharddoom_ior(dev, UHARDDOOM_TLB_ENTRY_TRANSLATION));
-		if (istatus & UHARDDOOM_INTR_PAGE_FAULT_COLORMAP)
-			printk(KERN_ALERT "uharddoom: got PAGE_FAULT_COLORMAP error [%08x]\n",
-					uharddoom_ior(dev, UHARDDOOM_TLB_ENTRY_COLORMAP));
-		if (istatus & UHARDDOOM_INTR_PAGE_FAULT_TRANMAP)
-			printk(KERN_ALERT "uharddoom: got PAGE_FAULT_TRANMAP error [%08x]\n",
-					uharddoom_ior(dev, UHARDDOOM_TLB_ENTRY_TRANMAP));
+#endif
 	}
 	spin_unlock_irqrestore(&dev->slock, flags);
 	return IRQ_RETVAL(istatus);
 }
 
-/* Paged memory handling.  */
-
-static struct uharddoom_buffer *uharddoom_buffer_create(struct uharddoom_device *dev, uint32_t size, uint16_t width, uint16_t height)
-{
-	int pti;
-	struct uharddoom_buffer *buffer = kzalloc(sizeof *buffer, 1);
-	if (!buffer)
-		return 0;
-	kref_init(&buffer->kref);
-	buffer->dev = dev;
-	buffer->size = size;
-	buffer->width = width;
-	buffer->height = height;
-	buffer->pnum = (size + UHARDDOOM_PAGE_SIZE - 1) >> UHARDDOOM_PAGE_SHIFT;
-	mutex_init(&buffer->lock);
-	uharddoom_fence_init(&buffer->free_fence);
-	uharddoom_fence_init(&buffer->read_fence);
-	buffer->pages = kzalloc(sizeof *buffer->pages * buffer->pnum, GFP_KERNEL);
-	if (!buffer->pages)
-		goto out_pages;
-	// XXX alignment?
-	if (!(buffer->pt_cpu = dma_alloc_coherent(&dev->pdev->dev,
-			buffer->pnum * 4,
-			&buffer->pt_dma, GFP_KERNEL)))
-		goto out_pt;
-	for (pti = 0; pti < buffer->pnum; pti++) {
-		if (!(buffer->pages[pti].page_cpu = dma_alloc_coherent(&dev->pdev->dev,
-				UHARDDOOM_PAGE_SIZE,
-				&buffer->pages[pti].page_dma, GFP_KERNEL | __GFP_ZERO)))
-			goto out_page;
-		buffer->pt_cpu[pti] = __cpu_to_le32(buffer->pages[pti].page_dma >> 8 | UHARDDOOM_PTE_VALID | UHARDDOOM_PTE_WRITABLE);
-	}
-	return buffer;
-
-out_page:
-	for (; pti >= 0; pti--) {
-		dma_free_coherent(&dev->pdev->dev, UHARDDOOM_PAGE_SIZE, buffer->pages[pti].page_cpu, buffer->pages[pti].page_dma);
-	}
-	dma_free_coherent(&dev->pdev->dev, buffer->pnum * 4, buffer->pt_cpu, buffer->pt_dma);
-out_pt:
-	kfree(buffer->pages);
-out_pages:
-	mutex_destroy(&buffer->lock);
-	kfree(buffer);
-	return 0;
-}
-
-static void uharddoom_buffer_destroy(struct uharddoom_buffer *buffer)
-{
-	int pti;
-	int i;
-	struct uharddoom_device *dev = buffer->dev;
-	uharddoom_fence_wait(dev, &buffer->free_fence);
-	mutex_lock(&dev->last_lock);
-	for (i = 0; i < 7; i++)
-		if (buffer == dev->last_bufs[i])
-			dev->last_bufs[i] = 0;
-	mutex_unlock(&dev->last_lock);
-	for (pti = 0; pti < buffer->pnum; pti++) {
-		dma_free_coherent(&dev->pdev->dev, UHARDDOOM_PAGE_SIZE, buffer->pages[pti].page_cpu, buffer->pages[pti].page_dma);
-	}
-	dma_free_coherent(&dev->pdev->dev, buffer->pnum * 4, buffer->pt_cpu, buffer->pt_dma);
-	mutex_destroy(&buffer->lock);
-	kfree(buffer->pages);
-	kfree(buffer);
-}
-
-static void uharddoom_buffer_destroy_kref(struct kref *kref) {
-	uharddoom_buffer_destroy(container_of(kref, struct uharddoom_buffer, kref));
-}
-
-static void uharddoom_buffer_put(struct uharddoom_buffer *buffer) {
-	if (buffer)
-		kref_put(&buffer->kref, uharddoom_buffer_destroy_kref);
-}
-
-static long uharddoom_buffer_read(struct uharddoom_buffer *buffer, void __user *buf, 
-		size_t len, loff_t off)
-{
-	long total = 0;
-	if (off >= buffer->size || off < 0)
-		return 0;
-	if (len >= buffer->size - off)
-		len = buffer->size - off;
-	while (len) {
-		int pti = off >> UHARDDOOM_PAGE_SHIFT;
-		int po = (off & (UHARDDOOM_PAGE_SIZE - 1));
-		int chunk = UHARDDOOM_PAGE_SIZE - po;
-		if (len < chunk)
-			chunk = len;
-		if (copy_to_user(buf, buffer->pages[pti].page_cpu + po, chunk))
-			return -EFAULT;
-		total += chunk;
-		off += chunk;
-		buf += chunk;
-		len -= chunk;
-	}
-	return total;
-}
-
-static long uharddoom_buffer_write(struct uharddoom_buffer *buffer, const void __user *buf, 
-		size_t len, loff_t off)
-{
-	long total = 0;
-	if (off >= buffer->size || off < 0)
-		return -ENOSPC;
-	if (len >= buffer->size - off)
-		len = buffer->size - off;
-	while (len) {
-		int pti = off >> UHARDDOOM_PAGE_SHIFT;
-		int po = (off & (UHARDDOOM_PAGE_SIZE - 1));
-		int chunk = UHARDDOOM_PAGE_SIZE - po;
-		if (len < chunk)
-			chunk = len;
-		if (copy_from_user(buffer->pages[pti].page_cpu + po, buf, chunk))
-			return -EFAULT;
-		total += chunk;
-		off += chunk;
-		buf += chunk;
-		len -= chunk;
-	}
-	return total;
-}
-
-static int uharddoom_setup(struct uharddoom_device *dev, struct uharddoom_buffer **bufs) {
-	int res;
-	uint32_t cmd[8] = {0};
-	uint32_t flags = 0;
-	uint16_t sdw = 0;
-	uint16_t ssw = 0;
-	int i;
-	for (i = 0; i < 7; i++)
-		if (bufs[i] && bufs[i] != dev->last_bufs[i]) {
-			if (i == 0)
-				sdw = bufs[i]->width;
-			if (i == 1)
-				ssw = bufs[i]->width;
-			cmd[1+i] = bufs[i]->pt_dma >> 8;
-			flags |= 1 << (9 + i);
-		}
-	if (!flags)
-		return 0;
-	cmd[0] = UHARDDOOM_CMD_W0_SETUP(UHARDDOOM_CMD_TYPE_SETUP, flags, sdw, ssw);
-	if ((res = uharddoom_submit(dev, cmd)))
-		return res;
-	for (i = 0; i < 7; i++)
-		if (bufs[i])
-			dev->last_bufs[i] = bufs[i];
-	return 0;
-}
-
-
 /* Buffer node handling.  */
+
+static vm_fault_t uharddoom_buffer_fault(struct vm_fault *vmf)
+{
+	struct uharddoom_buffer *buf = vmf->vma->vm_file->private_data;
+	unsigned long offset = vmf->pgoff << PAGE_SHIFT;
+	if (offset >= buf->size)
+		return VM_FAULT_SIGBUS;
+	vmf->page = virt_to_page(buf->pages[offset >> UHARDDOOM_PAGE_SHIFT].page_cpu);
+	get_page(vmf->page);
+	return 0;
+}
+
+static const struct vm_operations_struct uharddoom_buffer_vm_ops = {
+	.fault = uharddoom_buffer_fault,
+};
 
 static int uharddoom_buffer_release(struct inode *inode, struct file *file)
 {
@@ -498,340 +682,26 @@ static int uharddoom_buffer_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static ssize_t uharddoom_buffer_file_read(struct file *file, char __user *buf,
-		size_t len, loff_t *off)
+static int uharddoom_buffer_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	struct uharddoom_buffer *surf = file->private_data;
-	int res;
-	if ((res = mutex_lock_interruptible(&surf->lock)))
-		return res;
-	if ((res = uharddoom_fence_wait_interruptible(surf->dev, &surf->read_fence))) {
-		mutex_unlock(&surf->lock);
-		return res;
-	}
-	res = uharddoom_buffer_read(surf, buf, len, *off);
-	if (res > 0)
-		*off += res;
-	mutex_unlock(&surf->lock);
-	return res;
-}
-
-static ssize_t uharddoom_buffer_file_write(struct file *file, const char __user *buf,
-		size_t len, loff_t *off)
-{
-	struct uharddoom_buffer *surf = file->private_data;
-	int res;
-	if ((res = mutex_lock_interruptible(&surf->lock)))
-		return res;
-	if ((res = uharddoom_fence_wait_interruptible(surf->dev, &surf->free_fence))) {
-		mutex_unlock(&surf->lock);
-		return res;
-	}
-	res = uharddoom_buffer_write(surf, buf, len, *off);
-	if (res > 0)
-		*off += res;
-	mutex_unlock(&surf->lock);
-	return res;
+	vma->vm_ops = &uharddoom_buffer_vm_ops;
+	return 0;
 }
 
 static const struct file_operations uharddoom_buffer_file_ops = {
 	.owner = THIS_MODULE,
 	.release = uharddoom_buffer_release,
-	.read = uharddoom_buffer_file_read,
-	.write = uharddoom_buffer_file_write,
+	.mmap = uharddoom_buffer_mmap,
 };
-
-static ssize_t uharddoom_write(struct file *file, const char __user *buf,
-		size_t len, loff_t *off)
-{
-	int res;
-	int i;
-	size_t processed = 0;
-	int used[7] = {1, 0, 0, 0, 0, 0, 0};
-	struct uharddoom_context *ctx = file->private_data;
-	if (len % sizeof (struct doomdev2_cmd))
-		return -EINVAL;
-	if (!len)
-		return 0;
-	if ((res = mutex_lock_interruptible(&ctx->lock)))
-		goto out_lock_ctx;
-	if ((res = mutex_lock_interruptible(&ctx->dev->submit_lock)))
-		goto out_lock_submit;
-	mutex_lock(&ctx->dev->last_lock);
-	if ((res = uharddoom_setup(ctx->dev, ctx->bufs))) {
-		mutex_unlock(&ctx->dev->last_lock);
-		goto out_setup;
-	}
-	mutex_unlock(&ctx->dev->last_lock);
-	if (!ctx->bufs[0]) {
-		res = -EINVAL;
-		goto out_setup;
-	}
-	while (processed < len) {
-		struct doomdev2_cmd ucmd;
-		uint32_t cmd[8] = {0};
-		if (copy_from_user(&ucmd, buf, sizeof ucmd)) {
-			res = -EFAULT;
-			break;
-		}
-		switch (ucmd.type) {
-			case DOOMDEV2_CMD_TYPE_FILL_RECT:
-				if (ucmd.fill_rect.pos_x + ucmd.fill_rect.width > ctx->bufs[0]->width) {
-					res = -EINVAL;
-					goto end;
-				}
-				if (ucmd.fill_rect.pos_y + ucmd.fill_rect.height > ctx->bufs[0]->height) {
-					res = -EINVAL;
-					goto end;
-				}
-				cmd[0] = UHARDDOOM_CMD_TYPE_FILL_RECT;
-				cmd[2] = UHARDDOOM_CMD_W2(ucmd.fill_rect.pos_x, ucmd.fill_rect.pos_y, 0);
-				cmd[6] = UHARDDOOM_CMD_W6_A(ucmd.fill_rect.width, ucmd.fill_rect.height, ucmd.fill_rect.fill_color);
-				break;
-			case DOOMDEV2_CMD_TYPE_COPY_RECT:
-				if (!ctx->bufs[1]) {
-					res = -EINVAL;
-					goto end;
-				}
-				used[1] = 1;
-				if (ucmd.copy_rect.pos_dst_x + ucmd.copy_rect.width > ctx->bufs[0]->width) {
-					res = -EINVAL;
-					goto end;
-				}
-				if (ucmd.copy_rect.pos_dst_y + ucmd.copy_rect.height > ctx->bufs[0]->height) {
-					res = -EINVAL;
-					goto end;
-				}
-				if (ucmd.copy_rect.pos_src_x + ucmd.copy_rect.width > ctx->bufs[1]->width) {
-					res = -EINVAL;
-					goto end;
-				}
-				if (ucmd.copy_rect.pos_src_y + ucmd.copy_rect.height > ctx->bufs[1]->height) {
-					res = -EINVAL;
-					goto end;
-				}
-				cmd[0] = UHARDDOOM_CMD_TYPE_COPY_RECT;
-				if (ctx->bufs[1]->dirty) {
-					ctx->bufs[1]->dirty = 0;
-					cmd[0] |= UHARDDOOM_CMD_FLAG_INTERLOCK;
-				}
-				cmd[2] = UHARDDOOM_CMD_W2(ucmd.copy_rect.pos_dst_x, ucmd.copy_rect.pos_dst_y, 0);
-				cmd[3] = UHARDDOOM_CMD_W3(ucmd.copy_rect.pos_src_x, ucmd.copy_rect.pos_src_y);
-				cmd[6] = UHARDDOOM_CMD_W6_A(ucmd.copy_rect.width, ucmd.copy_rect.height, 0);
-				break;
-			case DOOMDEV2_CMD_TYPE_DRAW_LINE:
-				if (ucmd.draw_line.pos_a_x >= ctx->bufs[0]->width || ucmd.draw_line.pos_a_y >= ctx->bufs[0]->height) {
-					res = -EINVAL;
-					break;
-				}
-				if (ucmd.draw_line.pos_b_x >= ctx->bufs[0]->width || ucmd.draw_line.pos_b_y >= ctx->bufs[0]->height) {
-					res = -EINVAL;
-					break;
-				}
-				cmd[0] = UHARDDOOM_CMD_TYPE_DRAW_LINE;
-				cmd[2] = UHARDDOOM_CMD_W2(ucmd.draw_line.pos_a_x, ucmd.draw_line.pos_a_y, 0);
-				cmd[3] = UHARDDOOM_CMD_W3(ucmd.draw_line.pos_b_x, ucmd.draw_line.pos_b_y);
-				cmd[6] = UHARDDOOM_CMD_W6_A(0, 0, ucmd.draw_line.fill_color);
-				break;
-			case DOOMDEV2_CMD_TYPE_DRAW_BACKGROUND:
-				if (!ctx->bufs[3]) {
-					res = -EINVAL;
-					goto end;
-				}
-				used[3] = 1;
-				if (ucmd.draw_background.pos_x + ucmd.draw_background.width > ctx->bufs[0]->width) {
-					res = -EINVAL;
-					goto end;
-				}
-				if (ucmd.draw_background.pos_y + ucmd.draw_background.height > ctx->bufs[0]->height) {
-					res = -EINVAL;
-					goto end;
-				}
-				if ((ucmd.draw_background.flat_idx + 1) * 0x1000 > ctx->bufs[3]->size) {
-					res = -EINVAL;
-					goto end;
-				}
-				cmd[0] = UHARDDOOM_CMD_TYPE_DRAW_BACKGROUND;
-				cmd[2] = UHARDDOOM_CMD_W2(ucmd.draw_background.pos_x, ucmd.draw_background.pos_y, ucmd.draw_background.flat_idx);
-				cmd[6] = UHARDDOOM_CMD_W6_A(ucmd.draw_background.width, ucmd.draw_background.height, 0);
-				break;
-			case DOOMDEV2_CMD_TYPE_DRAW_COLUMN: {
-				int tridx = 0;
-				int cmidx = 0;
-				cmd[0] = UHARDDOOM_CMD_TYPE_DRAW_COLUMN;
-				if (!ctx->bufs[2]) {
-					res = -EINVAL;
-					goto end;
-				}
-				used[2] = 1;
-				if (ucmd.draw_column.flags & DOOMDEV2_CMD_FLAGS_TRANSLATE) {
-					if (!ctx->bufs[4] || ctx->bufs[4]->size < (ucmd.draw_column.translation_idx + 1) * 0x100) {
-						res = -EINVAL;
-						goto end;
-					}
-					used[4] = 1;
-					cmd[0] |= UHARDDOOM_CMD_FLAG_TRANSLATION;
-					tridx = ucmd.draw_column.translation_idx;
-				}
-				if (ucmd.draw_column.flags & DOOMDEV2_CMD_FLAGS_COLORMAP) {
-					if (!ctx->bufs[5] || ctx->bufs[5]->size < (ucmd.draw_column.colormap_idx + 1) * 0x100) {
-						res = -EINVAL;
-						goto end;
-					}
-					used[5] = 1;
-					cmd[0] |= UHARDDOOM_CMD_FLAG_COLORMAP;
-					cmidx = ucmd.draw_column.colormap_idx;
-				}
-				if (ucmd.draw_column.flags & DOOMDEV2_CMD_FLAGS_TRANMAP) {
-					if (!ctx->bufs[6] || ctx->bufs[6]->size < 0x10000) {
-						res = -EINVAL;
-						goto end;
-					}
-					used[6] = 1;
-					cmd[0] |= UHARDDOOM_CMD_FLAG_TRANMAP;
-				}
-				cmd[1] = UHARDDOOM_CMD_W1(tridx, cmidx);
-				if (ucmd.draw_column.pos_x >= ctx->bufs[0]->width) {
-					res = -EINVAL;
-					goto end;
-				}
-				if (ucmd.draw_column.pos_b_y >= ctx->bufs[0]->height || ucmd.draw_column.pos_b_y < ucmd.draw_column.pos_a_y) {
-					res = -EINVAL;
-					goto end;
-				}
-				cmd[2] = UHARDDOOM_CMD_W2(ucmd.draw_column.pos_x, ucmd.draw_column.pos_a_y, 0);
-				cmd[3] = UHARDDOOM_CMD_W3(ucmd.draw_column.pos_x, ucmd.draw_column.pos_b_y);
-				cmd[4] = ucmd.draw_column.ustart;
-				cmd[5] = ucmd.draw_column.ustep;
-				cmd[6] = ucmd.draw_column.texture_offset;
-				if (ucmd.draw_column.texture_offset & ~0x3fffff) {
-					res = -EINVAL;
-					goto end;
-				}
-				cmd[7] = UHARDDOOM_CMD_W7_B((ctx->bufs[2]->size - 1) >> 6, ucmd.draw_column.texture_height);
-				break;
-			}
-			case DOOMDEV2_CMD_TYPE_DRAW_FUZZ: {
-				cmd[0] = UHARDDOOM_CMD_TYPE_DRAW_FUZZ;
-				if (!ctx->bufs[2]) {
-					res = -EINVAL;
-					goto end;
-				}
-				used[2] = 1;
-				if (!ctx->bufs[5] || ctx->bufs[5]->size < (ucmd.draw_fuzz.colormap_idx + 1) * 0x100) {
-					res = -EINVAL;
-					goto end;
-				}
-				used[5] = 1;
-				cmd[1] = UHARDDOOM_CMD_W1(0, ucmd.draw_fuzz.colormap_idx);
-				if (ucmd.draw_fuzz.pos_x >= ctx->bufs[0]->width) {
-					res = -EINVAL;
-					goto end;
-				}
-				if (ucmd.draw_fuzz.fuzz_end >= ctx->bufs[0]->height ||
-						ucmd.draw_fuzz.pos_b_y > ucmd.draw_fuzz.fuzz_end ||
-						ucmd.draw_fuzz.pos_a_y > ucmd.draw_fuzz.pos_b_y ||
-						ucmd.draw_fuzz.fuzz_start > ucmd.draw_fuzz.pos_a_y ||
-						ucmd.draw_fuzz.fuzz_pos >= 50) {
-					res = -EINVAL;
-					goto end;
-				}
-				cmd[2] = UHARDDOOM_CMD_W2(ucmd.draw_fuzz.pos_x, ucmd.draw_fuzz.pos_a_y, 0);
-				cmd[3] = UHARDDOOM_CMD_W3(ucmd.draw_fuzz.pos_x, ucmd.draw_fuzz.pos_b_y);
-				cmd[6] = UHARDDOOM_CMD_W6_C(ucmd.draw_fuzz.fuzz_start, ucmd.draw_fuzz.fuzz_end, ucmd.draw_fuzz.fuzz_pos);
-				break;
-			}
-			case DOOMDEV2_CMD_TYPE_DRAW_SPAN: {
-				int tridx = 0;
-				int cmidx = 0;
-				cmd[0] = UHARDDOOM_CMD_TYPE_DRAW_SPAN;
-				if (!ctx->bufs[3] || ctx->bufs[3]->size < (ucmd.draw_span.flat_idx + 1) * 0x1000) {
-					res = -EINVAL;
-					goto end;
-				}
-				used[3] = 1;
-				if (ucmd.draw_span.flags & DOOMDEV2_CMD_FLAGS_TRANSLATE) {
-					if (!ctx->bufs[4] || ctx->bufs[4]->size < (ucmd.draw_span.translation_idx + 1) * 0x100) {
-						res = -EINVAL;
-						goto end;
-					}
-					used[4] = 1;
-					cmd[0] |= UHARDDOOM_CMD_FLAG_TRANSLATION;
-					tridx = ucmd.draw_span.translation_idx;
-				}
-				if (ucmd.draw_span.flags & DOOMDEV2_CMD_FLAGS_COLORMAP) {
-					if (!ctx->bufs[5] || ctx->bufs[5]->size < (ucmd.draw_span.colormap_idx + 1) * 0x100) {
-						res = -EINVAL;
-						goto end;
-					}
-					used[5] = 1;
-					cmd[0] |= UHARDDOOM_CMD_FLAG_COLORMAP;
-					cmidx = ucmd.draw_span.colormap_idx;
-				}
-				if (ucmd.draw_span.flags & DOOMDEV2_CMD_FLAGS_TRANMAP) {
-					if (!ctx->bufs[6] || ctx->bufs[6]->size < 0x10000) {
-						res = -EINVAL;
-						goto end;
-					}
-					used[6] = 1;
-					cmd[0] |= UHARDDOOM_CMD_FLAG_TRANMAP;
-				}
-				cmd[1] = UHARDDOOM_CMD_W1(tridx, cmidx);
-				if (ucmd.draw_span.pos_y >= ctx->bufs[0]->height) {
-					res = -EINVAL;
-					goto end;
-				}
-				if (ucmd.draw_span.pos_b_x >= ctx->bufs[0]->width || ucmd.draw_span.pos_b_x < ucmd.draw_span.pos_a_x) {
-					res = -EINVAL;
-					goto end;
-				}
-				cmd[2] = UHARDDOOM_CMD_W2(ucmd.draw_span.pos_a_x, ucmd.draw_span.pos_y, ucmd.draw_span.flat_idx);
-				cmd[3] = UHARDDOOM_CMD_W3(ucmd.draw_span.pos_b_x, ucmd.draw_span.pos_y);
-				cmd[4] = ucmd.draw_span.ustart;
-				cmd[5] = ucmd.draw_span.ustep;
-				cmd[6] = ucmd.draw_span.vstart;
-				cmd[7] = ucmd.draw_span.vstep;
-				break;
-			}
-			default:
-				res = -EINVAL;
-				goto end;
-		}
-		if ((res = uharddoom_submit(ctx->dev, cmd)))
-			break;
-		processed += sizeof ucmd;
-		buf += sizeof ucmd;
-	}
-end:
-	mutex_lock(&ctx->bufs[0]->lock);
-	ctx->bufs[0]->dirty = 1;
-	uharddoom_fence_set(ctx->dev, &ctx->bufs[0]->read_fence);
-	mutex_unlock(&ctx->bufs[0]->lock);
-	for (i = 0; i < 7; i++)
-		if (used[i]) {
-			mutex_lock(&ctx->bufs[i]->lock);
-			uharddoom_fence_set(ctx->dev, &ctx->bufs[i]->free_fence);
-			mutex_unlock(&ctx->bufs[i]->lock);
-		}
-
-out_setup:
-	mutex_unlock(&ctx->dev->submit_lock);
-out_lock_submit:
-	mutex_unlock(&ctx->lock);
-out_lock_ctx:
-	return processed ? processed : res;
-}
 
 /* Main device node handling.  */
 
 static int uharddoom_open(struct inode *inode, struct file *file)
 {
 	struct uharddoom_device *dev = container_of(inode->i_cdev, struct uharddoom_device, cdev);
-	struct uharddoom_context *ctx = kzalloc(sizeof *ctx, GFP_KERNEL);
+	struct uharddoom_context *ctx = uharddoom_context_create(dev);
 	if (!ctx)
 		return -ENOMEM;
-	ctx->dev = dev;
-	mutex_init(&ctx->lock);
 	file->private_data = ctx;
 	return nonseekable_open(inode, file);
 }
@@ -839,15 +709,11 @@ static int uharddoom_open(struct inode *inode, struct file *file)
 static int uharddoom_release(struct inode *inode, struct file *file)
 {
 	struct uharddoom_context *ctx = file->private_data;
-	int i;
-	for (i = 0; i < 7; i++)
-		uharddoom_buffer_put(ctx->bufs[i]);
-	kfree(ctx);
+	uharddoom_context_destroy(ctx);
 	return 0;
 }
 
-int uharddoom_make_fd(const char *name, const struct file_operations *fops,
-		     struct uharddoom_buffer *priv)
+int uharddoom_make_fd(struct uharddoom_buffer *priv)
 {
 	int error, fd;
 	struct file *file;
@@ -857,7 +723,7 @@ int uharddoom_make_fd(const char *name, const struct file_operations *fops,
 		return error;
 	fd = error;
 
-	file = anon_inode_getfile(name, fops, priv, O_RDWR | O_CLOEXEC);
+	file = anon_inode_getfile("uharddoom_buffer", &uharddoom_buffer_file_ops, priv, O_RDWR | O_CLOEXEC);
 	if (IS_ERR(file)) {
 		error = PTR_ERR(file);
 		goto err_put_unused_fd;
@@ -889,7 +755,7 @@ static struct uharddoom_buffer *uharddoom_get_buffer(struct uharddoom_device *de
 		fdput(bfd);
 		return ERR_PTR(-EXDEV);
 	}
-	kref_get(&res->kref);
+	uharddoom_buffer_get(res);
 	fdput(bfd);
 	return res;
 }
@@ -901,120 +767,57 @@ static long uharddoom_ioctl(struct file *file, unsigned int cmd, unsigned long a
 	int res;
 	void __user *parg = (void __user *)arg;
 	switch (cmd) {
-	case DOOMDEV2_IOCTL_CREATE_SURFACE: {
-		struct doomdev2_ioctl_create_surface param;
-		struct uharddoom_buffer *surf;
-		if (copy_from_user(&param, parg, sizeof param))
-			return -EFAULT;
-		if (param.width > 2048 || !param.width || param.width % 64)
-			return -EINVAL;
-		if (param.height > 2048 || !param.height)
-			return -EINVAL;
-		surf = uharddoom_buffer_create(dev, param.width * param.height, param.width, param.height);
-		if (!surf)
-			return -ENOMEM;
-		res = uharddoom_make_fd("uharddoom_surf", &uharddoom_buffer_file_ops, surf);
-		if (res < 0)
-			uharddoom_buffer_destroy(surf);
-		return res;
-	}
-	case DOOMDEV2_IOCTL_CREATE_BUFFER: {
-		struct doomdev2_ioctl_create_buffer param;
+	case UDOOMDEV_IOCTL_CREATE_BUFFER: {
+		struct udoomdev_ioctl_create_buffer param;
 		struct uharddoom_buffer *buffer;
-		uint32_t size;
 		if (copy_from_user(&param, parg, sizeof param))
 			return -EFAULT;
 		if (param.size > 0x400000 || param.size == 0)
 			return -EINVAL;
-		size = param.size;
-		if (size & 0x3f) {
-			size |= 0x3f;
-			size++;
-		}
-		buffer = uharddoom_buffer_create(dev, size, 0, 0);
+		buffer = uharddoom_buffer_create(dev, param.size);
 		if (!buffer)
 			return -ENOMEM;
-		if ((res = uharddoom_make_fd("uharddoom_texture", &uharddoom_buffer_file_ops,
-				buffer)) < 0)
-			goto tex_out_anon;
+		if ((res = uharddoom_make_fd(buffer)) < 0)
+			goto buf_out_anon;
 		return res;
-tex_out_anon:
-		uharddoom_buffer_destroy(buffer);
+buf_out_anon:
+		uharddoom_buffer_put(buffer);
 		return res;
 	}
-	case DOOMDEV2_IOCTL_SETUP: {
-		int i;
-		struct doomdev2_ioctl_setup param;
-		struct uharddoom_buffer *bufs[7];
+	case UDOOMDEV_IOCTL_MAP_BUFFER: {
+		struct udoomdev_ioctl_map_buffer param;
+		struct uharddoom_buffer *buf;
+		uint32_t addr;
 		if (copy_from_user(&param, parg, sizeof param))
 			return -EFAULT;
-		if (mutex_lock_interruptible(&ctx->lock))
-			return -ERESTARTSYS;
-		bufs[0] = uharddoom_get_buffer(dev, param.surf_dst_fd);
-		if (IS_ERR(bufs[0])) {
-			res = PTR_ERR(bufs[0]);
-			goto out_surf_dst;
-		}
-		if (bufs[0] && !bufs[0]->width) {
-			res = -EINVAL;
-			goto out_surf_src;
-		}
-		bufs[1] = uharddoom_get_buffer(dev, param.surf_src_fd);
-		if (IS_ERR(bufs[1])) {
-			res = PTR_ERR(bufs[1]);
-			goto out_surf_src;
-		}
-		if (bufs[1] && !bufs[1]->width) {
-			res = -EINVAL;
-			goto out_texture;
-		}
-		bufs[2] = uharddoom_get_buffer(dev, param.texture_fd);
-		if (IS_ERR(bufs[2])) {
-			res = PTR_ERR(bufs[2]);
-			goto out_texture;
-		}
-		bufs[3] =  uharddoom_get_buffer(dev, param.flat_fd);
-		if (IS_ERR(bufs[3])) {
-			res = PTR_ERR(bufs[3]);
-			goto out_flat;
-		}
-		bufs[4] = uharddoom_get_buffer(dev, param.translation_fd);
-		if (IS_ERR(bufs[4])) {
-			res = PTR_ERR(bufs[4]);
-			goto out_translation;
-		}
-		bufs[5] = uharddoom_get_buffer(dev, param.colormap_fd);
-		if (IS_ERR(bufs[5])) {
-			res = PTR_ERR(bufs[5]);
-			goto out_colormap;
-		}
-		bufs[6] = uharddoom_get_buffer(dev, param.tranmap_fd);
-		if (IS_ERR(bufs[6])) {
-			res = PTR_ERR(bufs[6]);
-			goto out_tranmap;
-		}
-		for (i = 0; i < 7; i++) {
-			uharddoom_buffer_put(ctx->bufs[i]);
-			ctx->bufs[i] = bufs[i];
-		}
-		mutex_unlock(&ctx->lock);
-		return 0;
-
-out_tranmap:
-		uharddoom_buffer_put(bufs[5]);
-out_colormap:
-		uharddoom_buffer_put(bufs[4]);
-out_translation:
-		uharddoom_buffer_put(bufs[3]);
-out_flat:
-		uharddoom_buffer_put(bufs[2]);
-out_texture:
-		uharddoom_buffer_put(bufs[1]);
-out_surf_src:
-		uharddoom_buffer_put(bufs[0]);
-out_surf_dst:
-		mutex_unlock(&ctx->lock);
-		return res;
+		if (param.map_rdonly > 1)
+			return -EINVAL;
+		buf = uharddoom_get_buffer(dev, param.buf_fd);
+		if (IS_ERR(buf))
+			return PTR_ERR(buf);
+		res = uharddoom_vspace_map(ctx->vs, buf, param.map_rdonly, &addr);
+		uharddoom_buffer_put(buf);
+		if (res < 0)
+			return res;
+		return addr;
+	}
+	case UDOOMDEV_IOCTL_UNMAP_BUFFER: {
+		struct udoomdev_ioctl_unmap_buffer param;
+		if (copy_from_user(&param, parg, sizeof param))
+			return -EFAULT;
+		return uharddoom_vspace_unmap(ctx->vs, param.addr);
+	}
+	case UDOOMDEV_IOCTL_RUN: {
+		struct udoomdev_ioctl_run param;
+		if (copy_from_user(&param, parg, sizeof param))
+			return -EFAULT;
+		return uharddoom_context_run(ctx, param.addr, param.size);
+	}
+	case UDOOMDEV_IOCTL_WAIT: {
+		struct udoomdev_ioctl_wait param;
+		if (copy_from_user(&param, parg, sizeof param))
+			return -EFAULT;
+		return uharddoom_context_wait(ctx, param.num_back);
 	}
 	default:
 		return -ENOTTY;
@@ -1027,7 +830,6 @@ static const struct file_operations uharddoom_file_ops = {
 	.release = uharddoom_release,
 	.unlocked_ioctl = uharddoom_ioctl,
 	.compat_ioctl = uharddoom_ioctl,
-	.write = uharddoom_write,
 };
 
 /* PCI driver.  */
@@ -1048,12 +850,13 @@ static int uharddoom_probe(struct pci_dev *pdev,
 
 	/* Locks etc.  */
 	spin_lock_init(&dev->slock);
-	mutex_init(&dev->submit_lock);
+#ifdef USE_BATCH
+	/* XXX */
 	init_waitqueue_head(&dev->free_wq);
 	INIT_LIST_HEAD(&dev->fence_list);
-
-	/* Command bookkeeping.  */
-	dev->cmds_to_ping = UHARDDOOM_PING_INTERVAL;
+#else
+	INIT_LIST_HEAD(&dev->pending_jobs);
+#endif
 
 	/* Allocate a free index.  */
 	mutex_lock(&uharddoom_devices_lock);
@@ -1073,9 +876,9 @@ static int uharddoom_probe(struct pci_dev *pdev,
 	if ((err = pci_enable_device(pdev)))
 		goto out_enable;
 
-	if ((err = pci_set_dma_mask(pdev, DMA_BIT_MASK(32))))
+	if ((err = pci_set_dma_mask(pdev, DMA_BIT_MASK(40))))
 		goto out_mask;
-	if ((err = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(32))))
+	if ((err = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(40))))
 		goto out_mask;
 	pci_set_master(pdev);
 
@@ -1095,13 +898,12 @@ static int uharddoom_probe(struct pci_dev *pdev,
 	/* Reset things that need resetting.  */
 	uharddoom_iow(dev, UHARDDOOM_INTR, UHARDDOOM_INTR_MASK);
 	uharddoom_iow(dev, UHARDDOOM_RESET, UHARDDOOM_RESET_ALL);
-	uharddoom_iow(dev, UHARDDOOM_FENCE_COUNTER, 0);
-	uharddoom_iow(dev, UHARDDOOM_FENCE_WAIT, 0);
 	uharddoom_iow(dev, UHARDDOOM_FE_CODE_ADDR, 0);
-	for (i = 0; i < ARRAY_SIZE(doomcode2); i++)
-		uharddoom_iow(dev, UHARDDOOM_FE_CODE_WINDOW, doomcode2[i]);
+	for (i = 0; i < ARRAY_SIZE(udoomfw); i++)
+		uharddoom_iow(dev, UHARDDOOM_FE_CODE_WINDOW, udoomfw[i]);
 
-#ifdef USE_CMD_FETCH
+#ifdef USE_BATCH
+	/* XXX */
 	/* Set up the command buffer.  */
 	dev->cmd_buf = uharddoom_buffer_create(dev, COMMAND_BUF_SIZE * 32, 0, 0);
 	if (!dev->cmd_buf) {
@@ -1115,11 +917,12 @@ static int uharddoom_probe(struct pci_dev *pdev,
 #endif
 	
 	/* Now bring up the device.  */
-	uharddoom_iow(dev, UHARDDOOM_INTR_ENABLE, UHARDDOOM_INTR_MASK & ~UHARDDOOM_INTR_PONG_ASYNC);
-#ifdef USE_CMD_FETCH
+#ifdef USE_BATCH
 	uharddoom_iow(dev, UHARDDOOM_ENABLE, UHARDDOOM_ENABLE_ALL);
+	uharddoom_iow(dev, UHARDDOOM_INTR_ENABLE, UHARDDOOM_INTR_MASK & ~UHARDDOOM_INTR_JOB_DONE);
 #else
-	uharddoom_iow(dev, UHARDDOOM_ENABLE, UHARDDOOM_ENABLE_ALL & ~UHARDDOOM_ENABLE_CMD_FETCH);
+	uharddoom_iow(dev, UHARDDOOM_ENABLE, UHARDDOOM_ENABLE_ALL & ~UHARDDOOM_ENABLE_BATCH);
+	uharddoom_iow(dev, UHARDDOOM_INTR_ENABLE, UHARDDOOM_INTR_MASK);
 #endif
 
 	/* We're live.  Let's export the cdev.  */
@@ -1130,7 +933,7 @@ static int uharddoom_probe(struct pci_dev *pdev,
 	/* And register it in sysfs.  */
 	dev->dev = device_create(&uharddoom_class,
 			&dev->pdev->dev, uharddoom_devno + dev->idx, dev,
-			"doom%d", dev->idx);
+			"udoom%d", dev->idx);
 	if (IS_ERR(dev->dev)) {
 		printk(KERN_ERR "uharddoom: failed to register subdevice\n");
 		/* too bad. */
@@ -1140,7 +943,8 @@ static int uharddoom_probe(struct pci_dev *pdev,
 	return 0;
 
 out_cdev:
-#ifdef USE_CMD_FETCH
+#ifdef USE_BATCH
+	/* XXX batch */
 	uharddoom_buffer_destroy(dev->cmd_buf);
 out_cmd:
 #endif
@@ -1172,7 +976,8 @@ static void uharddoom_remove(struct pci_dev *pdev)
 	uharddoom_iow(dev, UHARDDOOM_INTR_ENABLE, 0);
 	uharddoom_iow(dev, UHARDDOOM_ENABLE, 0);
 	uharddoom_ior(dev, UHARDDOOM_INTR);
-#ifdef USE_CMD_FETCH
+#ifdef USE_BATCH
+	/* XXX batch */
 	uharddoom_buffer_destroy(dev->cmd_buf);
 #endif
 	free_irq(pdev->irq, dev);
@@ -1229,4 +1034,3 @@ static void uharddoom_exit(void)
 
 module_init(uharddoom_init);
 module_exit(uharddoom_exit);
-#endif
