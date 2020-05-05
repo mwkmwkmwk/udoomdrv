@@ -14,20 +14,11 @@
 
 #define UHARDDOOM_MAX_DEVICES 256
 
-// #define USE_BATCH
+#define USE_BATCH
 #define BATCH_BUF_SIZE 0x100
 
 MODULE_AUTHOR("Marcelina Kościelnicka");
 MODULE_LICENSE("GPL");
-
-#if 0
-struct uharddoom_fence {
-	struct list_head lh;
-	wait_queue_head_t wq;
-	uint32_t counter;
-	int active;
-};
-#endif
 
 struct uharddoom_page {
 	void *page_cpu;
@@ -57,7 +48,21 @@ struct uharddoom_vspace {
 	struct list_head maps;
 };
 
-#ifndef USE_BATCH
+#ifdef USE_BATCH
+struct uharddoom_job {
+	struct list_head lh;
+	struct list_head ctx_lh;
+	struct uharddoom_context *ctx;
+	int batch_pos;
+};
+
+struct uharddoom_wait {
+	struct list_head lh;
+	struct completion completion;
+	int batch_pos;
+	int done;
+};
+#else
 struct uharddoom_job {
 	struct list_head lh;
 	struct uharddoom_context *ctx;
@@ -73,27 +78,17 @@ struct uharddoom_device {
 	struct device *dev;
 	void __iomem *bar;
 	spinlock_t slock;
-	/* XXX */
 #ifdef USE_BATCH
 	struct uharddoom_vspace *batch_vs;
 	struct uharddoom_buffer *batch_buf;
+	uint32_t batch_addr;
 	int batch_put_idx;
 	int batch_get_idx;
-#else
+	struct list_head waits;
+#else	
+	wait_queue_head_t idle_wq;
+#endif
 	struct list_head pending_jobs;
-#endif
-#if 0
-	int cmd_dirty;
-	int cmds_to_ping;
-	uint32_t fence_wait;
-	uint32_t last_recv_fence;
-	uint32_t last_sent_fence;
-	int free_count;
-	wait_queue_head_t free_wq;
-	int wait_for_free;
-	struct list_head fence_list;
-	uint32_t cmd_pending[8];
-#endif
 };
 
 struct uharddoom_context {
@@ -101,7 +96,7 @@ struct uharddoom_context {
 	struct uharddoom_device *dev;
 	struct uharddoom_vspace *vs;
 #ifdef USE_BATCH
-	/* XXX */
+	struct list_head pending_jobs;
 #else
 	int pending_jobs;
 	wait_queue_head_t wq;
@@ -148,7 +143,6 @@ static struct uharddoom_buffer *uharddoom_buffer_create(struct uharddoom_device 
 	buffer->pages = kzalloc(sizeof *buffer->pages * buffer->pnum, GFP_KERNEL);
 	if (!buffer->pages)
 		goto out_pages;
-	// XXX alignment?
 	for (pti = 0; pti < buffer->pnum; pti++)
 		if (!(buffer->pages[pti].page_cpu = dma_alloc_coherent(&dev->pdev->dev,
 				UHARDDOOM_PAGE_SIZE,
@@ -326,6 +320,82 @@ static int uharddoom_vspace_unmap(struct uharddoom_vspace *vs, uint32_t addr) {
 
 /* Context handling.  */
 
+#ifdef USE_BATCH
+static int uharddoom_batch_lt(struct uharddoom_device *dev, int a, int b) {
+	if (a <= dev->batch_put_idx)
+		a += BATCH_BUF_SIZE;
+	if (b <= dev->batch_put_idx)
+		b += BATCH_BUF_SIZE;
+	return a < b;
+}
+
+static void uharddoom_update_wait(struct uharddoom_device *dev) {
+	int new_get;
+	struct list_head *lh, *tmp;
+	int changed;
+redo:
+	if (list_empty(&dev->waits)) {
+		uharddoom_iow(dev, UHARDDOOM_BATCH_WAIT, ~0xfu);
+	} else {
+		int idx = list_first_entry(&dev->waits, struct uharddoom_wait, lh)->batch_pos;
+		idx += 1;
+		idx %= BATCH_BUF_SIZE;
+		uharddoom_iow(dev, UHARDDOOM_BATCH_WAIT, dev->batch_addr + idx * UHARDDOOM_BATCH_JOB_SIZE);
+	}
+	new_get = (uharddoom_ior(dev, UHARDDOOM_BATCH_GET) - dev->batch_addr) / UHARDDOOM_BATCH_JOB_SIZE;
+	changed = 0;
+	list_for_each_safe(lh, tmp, &dev->waits) {
+		struct uharddoom_wait *wait = list_entry(lh, struct uharddoom_wait, lh);
+		if (uharddoom_batch_lt(dev, wait->batch_pos, new_get)) {
+			complete(&wait->completion);
+			wait->done = 1;
+			list_del(&wait->lh);
+			changed = 1;
+		} else
+			break;
+	}
+	list_for_each_safe(lh, tmp, &dev->pending_jobs) {
+		struct uharddoom_job *job = list_entry(lh, struct uharddoom_job, lh);
+		if (uharddoom_batch_lt(dev, job->batch_pos, new_get)) {
+			list_del(&job->lh);
+			list_del(&job->ctx_lh);
+			kfree(job);
+		} else
+			break;
+	}
+	dev->batch_get_idx = new_get;
+	if (changed)
+		goto redo;
+}
+
+static void uharddoom_start_wait(struct uharddoom_device *dev, struct uharddoom_wait *wait, struct uharddoom_job *job) {
+	struct list_head *lh;
+	wait->batch_pos = job->batch_pos;
+	init_completion(&wait->completion);
+	wait->done = 0;
+	list_for_each(lh, &dev->waits) {
+		if (uharddoom_batch_lt(dev, wait->batch_pos, list_entry(lh, struct uharddoom_wait, lh)->batch_pos)) {
+			list_add_tail(&wait->lh, lh);
+			uharddoom_update_wait(dev);
+			return;
+		}
+	}
+	list_add_tail(&wait->lh, &dev->waits);
+	uharddoom_update_wait(dev);
+}
+
+static void uharddoom_abort_wait(struct uharddoom_device *dev, struct uharddoom_wait *wait) {
+	if (!wait->done) {
+		list_del(&wait->lh);
+		uharddoom_update_wait(dev);
+	}
+}
+
+static int uharddoom_batch_avail(struct uharddoom_device *dev) {
+	return (dev->batch_put_idx + 1) % BATCH_BUF_SIZE != dev->batch_get_idx;
+}
+#endif
+
 static struct uharddoom_context *uharddoom_context_create(struct uharddoom_device *dev) {
 	struct uharddoom_context *ctx = kzalloc(sizeof *ctx, GFP_KERNEL);
 	if (!ctx)
@@ -338,7 +408,7 @@ static struct uharddoom_context *uharddoom_context_create(struct uharddoom_devic
 		return 0;
 	}
 #ifdef USE_BATCH
-	/* XXX */
+	INIT_LIST_HEAD(&ctx->pending_jobs);
 #else
 	ctx->pending_jobs = 0;
 	init_waitqueue_head(&ctx->wq);
@@ -348,7 +418,18 @@ static struct uharddoom_context *uharddoom_context_create(struct uharddoom_devic
 
 static void uharddoom_context_destroy(struct uharddoom_context *ctx) {
 #ifdef USE_BATCH
-	/* XXX */
+	unsigned long flags;
+	struct uharddoom_device *dev = ctx->dev;
+	spin_lock_irqsave(&dev->slock, flags);
+	if (!list_empty(&ctx->pending_jobs)) {
+		struct uharddoom_job *job = list_last_entry(&ctx->pending_jobs, struct uharddoom_job, ctx_lh);
+		struct uharddoom_wait wait;
+		uharddoom_start_wait(ctx->dev, &wait, job);
+		spin_unlock_irqrestore(&dev->slock, flags);
+		wait_for_completion(&wait.completion);
+		spin_lock_irqsave(&dev->slock, flags);
+	}
+	spin_unlock_irqrestore(&dev->slock, flags);
 #else
 	wait_event(ctx->wq, !ctx->pending_jobs);
 #endif
@@ -360,18 +441,16 @@ static int uharddoom_context_run(struct uharddoom_context *ctx, uint32_t addr, u
 	int res = 0;
 	unsigned long flags;
 	struct uharddoom_device *dev = ctx->dev;
-#ifdef USE_BATCH
-	/* XXX */
-#else
 	struct uharddoom_job *job;
+#ifdef USE_BATCH
+	uint32_t off;
+	void *page;
+	__le32 *bjob;
 #endif
 	if (addr & 3 || size & 3)
 		return -EINVAL;
 	if (mutex_lock_interruptible(&ctx->lock))
 		return -ERESTARTSYS;
-#ifdef USE_BATCH
-	/* XXX */
-#else
 	if (ctx->error) {
 		res = -EIO;
 		goto out;
@@ -382,6 +461,45 @@ static int uharddoom_context_run(struct uharddoom_context *ctx, uint32_t addr, u
 		goto out;
 	}
 	job->ctx = ctx;
+#ifdef USE_BATCH
+	spin_lock_irqsave(&dev->slock, flags);
+	if (!uharddoom_batch_avail(dev)) {
+		uharddoom_update_wait(dev);
+		while (!uharddoom_batch_avail(dev)) {
+			struct uharddoom_job *fjob = list_first_entry(&dev->pending_jobs, struct uharddoom_job, lh);
+			struct uharddoom_wait wait;
+			uharddoom_start_wait(ctx->dev, &wait, fjob);
+			spin_unlock_irqrestore(&dev->slock, flags);
+			if (wait_for_completion_interruptible(&wait.completion)) {
+				spin_lock_irqsave(&dev->slock, flags);
+				uharddoom_abort_wait(dev, &wait);
+				spin_unlock_irqrestore(&dev->slock, flags);
+				kfree(job);
+				res = -ERESTARTSYS;
+				goto out;
+			}
+			spin_lock_irqsave(&dev->slock, flags);
+		}
+	}
+	if (ctx->error) {
+		spin_unlock_irqrestore(&dev->slock, flags);
+		kfree(job);
+		res = -EIO;
+		goto out;
+	}
+	off = dev->batch_put_idx * UHARDDOOM_BATCH_JOB_SIZE;
+	page = dev->batch_buf->pages[off >> UHARDDOOM_PAGE_SHIFT].page_cpu;
+	bjob = page + (off & 0xfff);
+	bjob[0] = cpu_to_le32(ctx->vs->pd_dma >> UHARDDOOM_PDP_SHIFT);
+	bjob[1] = cpu_to_le32(addr);
+	bjob[2] = cpu_to_le32(size);
+	job->batch_pos = dev->batch_put_idx++;
+	dev->batch_put_idx %= BATCH_BUF_SIZE;;
+	uharddoom_iow(dev, UHARDDOOM_BATCH_PUT, dev->batch_addr + dev->batch_put_idx * UHARDDOOM_BATCH_JOB_SIZE);
+	list_add_tail(&job->lh, &dev->pending_jobs);
+	list_add_tail(&job->ctx_lh, &ctx->pending_jobs);
+	spin_unlock_irqrestore(&dev->slock, flags);
+#else
 	job->cmd_ptr = addr;
 	job->cmd_size = size;
 	spin_lock_irqsave(&dev->slock, flags);
@@ -402,10 +520,45 @@ out:
 
 static int uharddoom_context_wait(struct uharddoom_context *ctx, int num_back) {
 	int res = 0;
+#ifdef USE_BATCH
+	unsigned long flags;
+	struct list_head *lh;
+	struct uharddoom_job *job;
+	struct uharddoom_wait wait;
+	struct uharddoom_device *dev = ctx->dev;
+#endif
 	if (mutex_lock_interruptible(&ctx->lock))
 		return -ERESTARTSYS;
 #ifdef USE_BATCH
-	/* XXX */
+	spin_lock_irqsave(&dev->slock, flags);
+	if (list_empty(&ctx->pending_jobs)) {
+		spin_unlock_irqrestore(&dev->slock, flags);
+		res = ctx->error ? -EIO : 0;
+		goto out;
+	}
+	lh = ctx->pending_jobs.next;
+	while (num_back--) {
+		lh = lh->next;
+		if (lh == &ctx->pending_jobs) {
+			spin_unlock_irqrestore(&dev->slock, flags);
+			res = ctx->error ? -EIO : 0;
+			goto out;
+		}
+	}
+	job = list_entry(lh, struct uharddoom_job, ctx_lh);
+	uharddoom_start_wait(ctx->dev, &wait, job);
+	spin_unlock_irqrestore(&dev->slock, flags);
+	if (wait_for_completion_interruptible(&wait.completion)) {
+		spin_lock_irqsave(&dev->slock, flags);
+		uharddoom_abort_wait(dev, &wait);
+		spin_unlock_irqrestore(&dev->slock, flags);
+		res = -ERESTARTSYS;
+		goto out;
+	}
+	spin_lock_irqsave(&dev->slock, flags);
+	if (ctx->error)
+		res = -EIO;
+	spin_unlock_irqrestore(&dev->slock, flags);
 #else
 	if (wait_event_interruptible(ctx->wq, ctx->pending_jobs <= num_back)) {
 		res = -ERESTARTSYS;
@@ -421,185 +574,6 @@ out:
 	return res;
 }
 
-#if 0
-static void uharddoom_process_fences(struct uharddoom_device *dev)
-{
-	struct list_head *lh, *tmp;
-	uint32_t last_fence = dev->last_recv_fence;
-	uint32_t cur_fence = uharddoom_ior(dev, UHARDDOOM_FENCE_COUNTER);
-	if (cur_fence == last_fence)
-		return;
-	list_for_each_safe(lh, tmp, &dev->fence_list) {
-		struct uharddoom_fence *fence = list_entry(lh, struct uharddoom_fence, lh);
-		if (last_fence < cur_fence) {
-			if (fence->counter <= last_fence || fence->counter > cur_fence)
-				break;
-		} else {
-			if (fence->counter <= last_fence && fence->counter > cur_fence)
-				break;
-		}
-		fence->active = 0;
-		list_del(lh);
-		wake_up(&fence->wq);
-	}
-	dev->last_recv_fence = cur_fence;
-}
-
-static void uharddoom_submit_raw(struct uharddoom_device *dev, uint32_t *cmd)
-{
-	int i;
-#ifdef USE_BATCH
-	int pidx = dev->cmd_write_idx / CMDS_PER_PAGE;
-	int cidx = dev->cmd_write_idx % CMDS_PER_PAGE;
-	struct uharddoom_page *page = &dev->cmd_buf->pages[pidx];
-	uint32_t *data = page->page_cpu;
-	for (i = 0; i < UHARDDOOM_CMD_SEND_SIZE; i++) {
-		data[cidx * 8 + i] =  __cpu_to_le32(cmd[i]);
-	}
-	dev->cmd_write_idx++;
-	if (dev->cmd_write_idx == COMMAND_BUF_SIZE)
-		dev->cmd_write_idx = 0;
-#else
-	for (i = 0; i < UHARDDOOM_CMD_SEND_SIZE; i++) {
-		uharddoom_iow(dev, UHARDDOOM_CMD_SEND(i), cmds[i]);
-	}
-#endif
-	dev->free_count--;
-}
-
-static void uharddoom_fence_cmd(struct uharddoom_device *dev)
-{
-	if (!dev->cmd_dirty)
-		return;
-	dev->last_sent_fence++;
-	dev->cmd_pending[0] |= UHARDDOOM_CMD_FLAG_FENCE;
-	uharddoom_submit_raw(dev, dev->cmd_pending);
-#ifdef USE_BATCH
-	uharddoom_iow(dev, UHARDDOOM_CMD_WRITE_IDX, dev->cmd_write_idx);
-#endif
-	dev->cmd_dirty = 0;
-}
-
-static void uharddoom_fence_init(struct uharddoom_fence *fence)
-{
-	fence->active = 0;
-	init_waitqueue_head(&fence->wq);
-}
-
-static void uharddoom_fence_set_waiting(struct uharddoom_device *dev, struct uharddoom_fence *fence)
-{
-	uint32_t cur, mine;
-	cur = dev->fence_wait - dev->last_recv_fence - 1;
-	mine = fence->counter - dev->last_recv_fence - 1;
-	if (mine < cur) {
-		dev->fence_wait = fence->counter;
-		uharddoom_iow(dev, UHARDDOOM_FENCE_WAIT, fence->counter);
-		uharddoom_process_fences(dev);
-	}
-}
-
-static void uharddoom_fence_wait(struct uharddoom_device *dev, struct uharddoom_fence *fence)
-{
-	unsigned long flags;
-	spin_lock_irqsave(&dev->slock, flags);
-	while (fence->active) {
-		uharddoom_fence_set_waiting(dev, fence);
-		spin_unlock_irqrestore(&dev->slock, flags);
-		wait_event(fence->wq, !fence->active);
-		spin_lock_irqsave(&dev->slock, flags);
-	}
-	spin_unlock_irqrestore(&dev->slock, flags);
-}
-
-static int uharddoom_fence_wait_interruptible(struct uharddoom_device *dev, struct uharddoom_fence *fence)
-{
-	int res;
-	unsigned long flags;
-	spin_lock_irqsave(&dev->slock, flags);
-	while (fence->active) {
-		uharddoom_fence_set_waiting(dev, fence);
-		spin_unlock_irqrestore(&dev->slock, flags);
-		if ((res = wait_event_interruptible(fence->wq, !fence->active)))
-			return res;
-		spin_lock_irqsave(&dev->slock, flags);
-	}
-	spin_unlock_irqrestore(&dev->slock, flags);
-	return 0;
-}
-
-static void uharddoom_fence_set(struct uharddoom_device *dev, struct uharddoom_fence *fence)
-{
-	unsigned long flags;
-	uharddoom_fence_cmd(dev);
-	spin_lock_irqsave(&dev->slock, flags);
-	if (fence->active)
-		list_del(&fence->lh);
-	fence->counter = dev->last_sent_fence;
-	fence->active = 1;
-	list_add_tail(&fence->lh, &dev->fence_list);
-	spin_unlock_irqrestore(&dev->slock, flags);
-}
-
-static void uharddoom_update_free_count(struct uharddoom_device *dev)
-{
-#ifdef USE_BATCH
-	int read_idx = uharddoom_ior(dev, UHARDDOOM_CMD_READ_IDX);
-	if (read_idx <= dev->cmd_write_idx)
-		dev->free_count = COMMAND_BUF_SIZE + read_idx - dev->cmd_write_idx - 1;
-	else
-		dev->free_count = read_idx - dev->cmd_write_idx - 1;
-#else
-	dev->free_count = uharddoom_ior(dev, UHARDDOOM_FIFO_FREE);
-#endif
-}
-
-static int uharddoom_wait_free(struct uharddoom_device *dev, int num)
-{
-	int res;
-	unsigned long flags;
-	if (num <= dev->free_count)
-		return 0;
-	spin_lock_irqsave(&dev->slock, flags);
-	uharddoom_process_fences(dev);
-	spin_unlock_irqrestore(&dev->slock, flags);
-	uharddoom_update_free_count(dev);
-	if (num <= dev->free_count)
-		return 0;
-	while (1) {
-		spin_lock_irqsave(&dev->slock, flags);
-		dev->wait_for_free = 1;
-		uharddoom_iow(dev, UHARDDOOM_INTR_ENABLE, UHARDDOOM_INTR_MASK);
-		spin_unlock_irqrestore(&dev->slock, flags);
-		uharddoom_update_free_count(dev);
-		if (num <= dev->free_count)
-			return 0;
-		if ((res = wait_event_interruptible(dev->free_wq, dev->wait_for_free == 0)))
-			return res;
-	}
-}
-
-static int uharddoom_submit(struct uharddoom_device *dev, uint32_t *cmd)
-{
-	int res;
-	if ((res = uharddoom_wait_free(dev, 2)))
-		return res;
-	if (dev->cmd_dirty)
-		uharddoom_submit_raw(dev, dev->cmd_pending);
-	memcpy(dev->cmd_pending, cmd, 32);
-	dev->cmd_dirty = 1;
-	dev->cmds_to_ping--;
-	if (!dev->cmds_to_ping) {
-		dev->cmds_to_ping = UHARDDOOM_PING_INTERVAL;
-		dev->cmd_pending[0] |= UHARDDOOM_CMD_FLAG_PING_ASYNC;
-#ifdef USE_BATCH
-		uharddoom_iow(dev, UHARDDOOM_CMD_WRITE_IDX, dev->cmd_write_idx);
-#endif
-	}
-	return 0;
-}
-
-#endif
-
 static irqreturn_t uharddoom_isr(int irq, void *opaque)
 {
 	struct uharddoom_device *dev = opaque;
@@ -610,25 +584,50 @@ static irqreturn_t uharddoom_isr(int irq, void *opaque)
 	istatus = uharddoom_ior(dev, UHARDDOOM_INTR) & uharddoom_ior(dev, UHARDDOOM_INTR_ENABLE);
 	if (istatus) {
 		struct uharddoom_job *job;
+		int error = 0;
 		uharddoom_iow(dev, UHARDDOOM_INTR, istatus);
+		if (istatus & (UHARDDOOM_INTR_FE_ERROR)) {
+			printk(KERN_ALERT "uharddoom: FE_ERROR %03x %08x %08x\n",
+					uharddoom_ior(dev, UHARDDOOM_FE_ERROR_CODE),
+					uharddoom_ior(dev, UHARDDOOM_FE_ERROR_DATA_A),
+					uharddoom_ior(dev, UHARDDOOM_FE_ERROR_DATA_B)
+			);
+			error = 1;
+		}
+		if (istatus & (UHARDDOOM_INTR_CMD_ERROR)) {
+			printk(KERN_ALERT "uharddoom: CMD_ERROR\n");
+			error = 1;
+		}
+		for (i = 0; i < 8; i++)
+			if (istatus & UHARDDOOM_INTR_PAGE_FAULT(i)) {
+				printk(KERN_ALERT "uharddoom: PAGE_FAULT %d %08x\n", i,
+						uharddoom_ior(dev, UHARDDOOM_TLB_CLIENT_VA(i)));
+				error = 1;
+			}
 #ifdef USE_BATCH
-		/* XXX */
+		uharddoom_update_wait(dev);
+		if (error) {
+			struct list_head *lh;
+			job = list_first_entry(&dev->pending_jobs, struct uharddoom_job, lh);
+			printk(KERN_ALERT "FAIL JOB %08x %08x\n", job->batch_pos * UHARDDOOM_BATCH_JOB_SIZE, dev->batch_get_idx * UHARDDOOM_BATCH_JOB_SIZE);
+			job->ctx->error = 1;
+			list_for_each(lh, &job->ctx->pending_jobs) {
+				struct uharddoom_job *ojob = list_entry(lh, struct uharddoom_job, ctx_lh);
+				uint32_t off = ojob->batch_pos * UHARDDOOM_BATCH_JOB_SIZE;
+				void *page = dev->batch_buf->pages[off >> UHARDDOOM_PAGE_SHIFT].page_cpu;
+				__le32 *bjob = page + (off & 0xfff);
+				printk(KERN_ALERT "KILL JOB %08x\n", off);
+				bjob[2] = 0;
+			}
+			uharddoom_iow(dev, UHARDDOOM_RESET, UHARDDOOM_RESET_ALL);
+			uharddoom_iow(dev, UHARDDOOM_INTR, UHARDDOOM_INTR_MASK);
+			uharddoom_iow(dev, UHARDDOOM_ENABLE, UHARDDOOM_ENABLE_ALL);
+			uharddoom_update_wait(dev);
+		}
 #else
 		BUG_ON(list_empty(&dev->pending_jobs));
 		job = list_first_entry(&dev->pending_jobs, struct uharddoom_job, lh);
-		if (istatus != UHARDDOOM_INTR_JOB_DONE) {
-			if (istatus & (UHARDDOOM_INTR_FE_ERROR))
-				printk(KERN_ALERT "uharddoom: FE_ERROR %03x %08x %08x\n",
-						uharddoom_ior(dev, UHARDDOOM_FE_ERROR_CODE),
-						uharddoom_ior(dev, UHARDDOOM_FE_ERROR_DATA_A),
-						uharddoom_ior(dev, UHARDDOOM_FE_ERROR_DATA_B)
-				);
-			if (istatus & (UHARDDOOM_INTR_CMD_ERROR))
-				printk(KERN_ALERT "uharddoom: CMD_ERROR\n");
-			for (i = 0; i < 8; i++)
-				if (istatus & UHARDDOOM_INTR_PAGE_FAULT(i))
-					printk(KERN_ALERT "uharddoom: PAGE_FAULT %d %08x\n", i,
-							uharddoom_ior(dev, UHARDDOOM_TLB_CLIENT_VA(i)));
+		if (error) {
 			job->ctx->error = 1;
 			uharddoom_iow(dev, UHARDDOOM_RESET, UHARDDOOM_RESET_ALL);
 			uharddoom_iow(dev, UHARDDOOM_INTR, UHARDDOOM_INTR_MASK);
@@ -652,6 +651,8 @@ retry:
 			uharddoom_iow(dev, UHARDDOOM_JOB_CMD_PTR, job->cmd_ptr);
 			uharddoom_iow(dev, UHARDDOOM_JOB_CMD_SIZE, job->cmd_size);
 			uharddoom_iow(dev, UHARDDOOM_JOB_TRIGGER, 0);
+		} else {
+			wake_up(&dev->idle_wq);
 		}
 #endif
 	}
@@ -851,12 +852,11 @@ static int uharddoom_probe(struct pci_dev *pdev,
 	/* Locks etc.  */
 	spin_lock_init(&dev->slock);
 #ifdef USE_BATCH
-	/* XXX */
-	init_waitqueue_head(&dev->free_wq);
-	INIT_LIST_HEAD(&dev->fence_list);
+	INIT_LIST_HEAD(&dev->waits);
 #else
-	INIT_LIST_HEAD(&dev->pending_jobs);
+	init_waitqueue_head(&dev->idle_wq);
 #endif
+	INIT_LIST_HEAD(&dev->pending_jobs);
 
 	/* Allocate a free index.  */
 	mutex_lock(&uharddoom_devices_lock);
@@ -864,7 +864,7 @@ static int uharddoom_probe(struct pci_dev *pdev,
 		if (!uharddoom_devices[i])
 			break;
 	if (i == UHARDDOOM_MAX_DEVICES) {
-		err = -ENOSPC; // XXX right?
+		err = -ENOSPC;
 		mutex_unlock(&uharddoom_devices_lock);
 		goto out_slot;
 	}
@@ -896,24 +896,34 @@ static int uharddoom_probe(struct pci_dev *pdev,
 		goto out_irq;
 
 	/* Reset things that need resetting.  */
-	uharddoom_iow(dev, UHARDDOOM_INTR, UHARDDOOM_INTR_MASK);
-	uharddoom_iow(dev, UHARDDOOM_RESET, UHARDDOOM_RESET_ALL);
 	uharddoom_iow(dev, UHARDDOOM_FE_CODE_ADDR, 0);
 	for (i = 0; i < ARRAY_SIZE(udoomfw); i++)
 		uharddoom_iow(dev, UHARDDOOM_FE_CODE_WINDOW, udoomfw[i]);
+	uharddoom_iow(dev, UHARDDOOM_INTR, UHARDDOOM_INTR_MASK);
+	uharddoom_iow(dev, UHARDDOOM_RESET, UHARDDOOM_RESET_ALL);
 
 #ifdef USE_BATCH
-	/* XXX */
-	/* Set up the command buffer.  */
-	dev->cmd_buf = uharddoom_buffer_create(dev, COMMAND_BUF_SIZE * 32, 0, 0);
-	if (!dev->cmd_buf) {
+	/* Set up the kernel vspace.  */
+	dev->batch_vs = uharddoom_vspace_create(dev);
+	if (!dev->batch_vs) {
 		err = -ENOMEM;
-		goto out_cmd;
+		goto out_vs;
 	}
-	uharddoom_iow(dev, UHARDDOOM_CMD_PT, dev->cmd_buf->pt_dma >> 8);
-	uharddoom_iow(dev, UHARDDOOM_CMD_SIZE, COMMAND_BUF_SIZE);
-	uharddoom_iow(dev, UHARDDOOM_CMD_READ_IDX, 0);
-	uharddoom_iow(dev, UHARDDOOM_CMD_WRITE_IDX, 0);
+	/* Set up the batch buffer.  */
+	dev->batch_buf = uharddoom_buffer_create(dev, BATCH_BUF_SIZE * UHARDDOOM_BATCH_JOB_SIZE);
+	if (!dev->batch_buf) {
+		err = -ENOMEM;
+		goto out_batch;
+	}
+	if ((err = uharddoom_vspace_map(dev->batch_vs, dev->batch_buf, 1, &dev->batch_addr)))
+		goto out_bmap;
+	dev->batch_put_idx = dev->batch_get_idx = 0;
+	uharddoom_iow(dev, UHARDDOOM_BATCH_PDP, dev->batch_vs->pd_dma >> UHARDDOOM_PDP_SHIFT);
+	uharddoom_iow(dev, UHARDDOOM_BATCH_WRAP_TO, dev->batch_addr);
+	uharddoom_iow(dev, UHARDDOOM_BATCH_WRAP_FROM, dev->batch_addr + BATCH_BUF_SIZE * UHARDDOOM_BATCH_JOB_SIZE);
+	uharddoom_iow(dev, UHARDDOOM_BATCH_GET, dev->batch_addr);
+	uharddoom_iow(dev, UHARDDOOM_BATCH_PUT, dev->batch_addr);
+	uharddoom_iow(dev, UHARDDOOM_BATCH_WAIT, ~0xfu);
 #endif
 	
 	/* Now bring up the device.  */
@@ -944,9 +954,11 @@ static int uharddoom_probe(struct pci_dev *pdev,
 
 out_cdev:
 #ifdef USE_BATCH
-	/* XXX batch */
-	uharddoom_buffer_destroy(dev->cmd_buf);
-out_cmd:
+out_bmap:
+	uharddoom_buffer_put(dev->batch_buf);
+out_batch:
+	uharddoom_vspace_destroy(dev->batch_vs);
+out_vs:
 #endif
 	free_irq(pdev->irq, dev);
 out_irq:
@@ -977,8 +989,8 @@ static void uharddoom_remove(struct pci_dev *pdev)
 	uharddoom_iow(dev, UHARDDOOM_ENABLE, 0);
 	uharddoom_ior(dev, UHARDDOOM_INTR);
 #ifdef USE_BATCH
-	/* XXX batch */
-	uharddoom_buffer_destroy(dev->cmd_buf);
+	uharddoom_buffer_put(dev->batch_buf);
+	uharddoom_vspace_destroy(dev->batch_vs);
 #endif
 	free_irq(pdev->irq, dev);
 	pci_iounmap(pdev, dev->bar);
@@ -987,8 +999,61 @@ static void uharddoom_remove(struct pci_dev *pdev)
 	mutex_lock(&uharddoom_devices_lock);
 	uharddoom_devices[dev->idx] = 0;
 	mutex_unlock(&uharddoom_devices_lock);
-	// XXX kref me instead?
 	kfree(dev);
+}
+
+static int uharddoom_suspend(struct pci_dev *pdev, pm_message_t state)
+{
+	unsigned long flags;
+	struct uharddoom_device *dev = pci_get_drvdata(pdev);
+	spin_lock_irqsave(&dev->slock, flags);
+#ifdef USE_BATCH
+	if (!list_empty(&dev->pending_jobs)) {
+		struct uharddoom_job *job = list_last_entry(&dev->pending_jobs, struct uharddoom_job, lh);
+		struct uharddoom_wait wait;
+		uharddoom_start_wait(dev, &wait, job);
+		spin_unlock_irqrestore(&dev->slock, flags);
+		wait_for_completion(&wait.completion);
+		spin_lock_irqsave(&dev->slock, flags);
+	}
+#else
+	while (!list_empty(&dev->pending_jobs)) {
+		spin_unlock_irqrestore(&dev->slock, flags);
+		wait_event(dev->idle_wq, list_empty(&dev->pending_jobs));
+		spin_lock_irqsave(&dev->slock, flags);
+	}
+#endif
+	spin_unlock_irqrestore(&dev->slock, flags);
+	uharddoom_iow(dev, UHARDDOOM_INTR_ENABLE, 0);
+	uharddoom_iow(dev, UHARDDOOM_ENABLE, 0);
+	uharddoom_ior(dev, UHARDDOOM_INTR);
+	return 0;
+}
+
+static int uharddoom_resume(struct pci_dev *pdev)
+{
+	struct uharddoom_device *dev = pci_get_drvdata(pdev);
+	int i;
+	uharddoom_iow(dev, UHARDDOOM_FE_CODE_ADDR, 0);
+	for (i = 0; i < ARRAY_SIZE(udoomfw); i++)
+		uharddoom_iow(dev, UHARDDOOM_FE_CODE_WINDOW, udoomfw[i]);
+	uharddoom_iow(dev, UHARDDOOM_INTR, UHARDDOOM_INTR_MASK);
+	uharddoom_iow(dev, UHARDDOOM_RESET, UHARDDOOM_RESET_ALL);
+#ifdef USE_BATCH
+	dev->batch_put_idx = dev->batch_get_idx = 0;
+	uharddoom_iow(dev, UHARDDOOM_BATCH_PDP, dev->batch_vs->pd_dma >> UHARDDOOM_PDP_SHIFT);
+	uharddoom_iow(dev, UHARDDOOM_BATCH_WRAP_TO, dev->batch_addr);
+	uharddoom_iow(dev, UHARDDOOM_BATCH_WRAP_FROM, dev->batch_addr + BATCH_BUF_SIZE * UHARDDOOM_BATCH_JOB_SIZE);
+	uharddoom_iow(dev, UHARDDOOM_BATCH_GET, dev->batch_addr);
+	uharddoom_iow(dev, UHARDDOOM_BATCH_PUT, dev->batch_addr);
+	uharddoom_iow(dev, UHARDDOOM_BATCH_WAIT, ~0xfu);
+	uharddoom_iow(dev, UHARDDOOM_ENABLE, UHARDDOOM_ENABLE_ALL);
+	uharddoom_iow(dev, UHARDDOOM_INTR_ENABLE, UHARDDOOM_INTR_MASK & ~UHARDDOOM_INTR_JOB_DONE);
+#else
+	uharddoom_iow(dev, UHARDDOOM_ENABLE, UHARDDOOM_ENABLE_ALL & ~UHARDDOOM_ENABLE_BATCH);
+	uharddoom_iow(dev, UHARDDOOM_INTR_ENABLE, UHARDDOOM_INTR_MASK);
+#endif
+	return 0;
 }
 
 static struct pci_device_id uharddoom_pciids[] = {
@@ -1001,7 +1066,8 @@ static struct pci_driver uharddoom_pci_driver = {
 	.id_table = uharddoom_pciids,
 	.probe = uharddoom_probe,
 	.remove = uharddoom_remove,
-	// XXX suspend
+	.suspend = uharddoom_suspend,
+	.resume = uharddoom_resume,
 };
 
 /* Init & exit.  */
